@@ -5,6 +5,8 @@
 #include <cstring>
 #include <thread>
 
+#include "app/capture_state.h"
+
 namespace {
 
 constexpr int kMainCameraCopyRetryDelayMs = 40;
@@ -252,6 +254,46 @@ bool main_camera_frame_buffer_copy(uint8_t* dst, size_t dst_size, size_t* out_si
 
     std::this_thread::sleep_for(std::chrono::milliseconds(kMainCameraCopyRetryDelayMs));
     return g_main_camera_frame_buffer.copy(dst, dst_size, out_size, out_frame_id);
+}
+
+bool main_camera_frame_buffer_copy_newer_than(uint8_t* dst,
+                                              size_t dst_size,
+                                              size_t* out_size,
+                                              uint64_t* out_frame_id,
+                                              uint64_t min_frame_id,
+                                              int timeout_ms,
+                                              int poll_interval_ms)
+{
+    return g_main_camera_frame_buffer.copy_newer_than(dst,
+                                                      dst_size,
+                                                      out_size,
+                                                      out_frame_id,
+                                                      min_frame_id,
+                                                      timeout_ms,
+                                                      poll_interval_ms);
+}
+
+bool main_camera_frame_buffer_request_fresh_copy(CaptureLoopState* state,
+                                                 uint8_t* dst,
+                                                 size_t dst_size,
+                                                 size_t* out_size,
+                                                 uint64_t* out_frame_id,
+                                                 int timeout_ms,
+                                                 int poll_interval_ms)
+{
+    if (!state || !dst || dst_size == 0) {
+        return false;
+    }
+
+    const uint64_t min_frame_id = getLatestMainCameraFrameId(state);
+    requestMainCameraRefresh(state);
+    return main_camera_frame_buffer_copy_newer_than(dst,
+                                                    dst_size,
+                                                    out_size,
+                                                    out_frame_id,
+                                                    min_frame_id,
+                                                    timeout_ms,
+                                                    poll_interval_ms);
 }
 
 int main_camera_frame_buffer_get_width()

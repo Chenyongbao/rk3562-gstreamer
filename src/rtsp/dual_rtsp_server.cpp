@@ -229,7 +229,7 @@ bool dual_rtsp_server_init(DualRTSPServer* server, const char* bind_address) {
         return false;
     }
 
-    server->original_stream.use_dmabuf = FALSE;
+    server->original_stream.use_dmabuf = TRUE;
     
     if (!rtsp_streamer_init(&server->bev_stream, 
                            BEV_OUTPUT_WIDTH, BEV_OUTPUT_HEIGHT, TARGET_FPS,
@@ -238,7 +238,7 @@ bool dual_rtsp_server_init(DualRTSPServer* server, const char* bind_address) {
         rtsp_streamer_cleanup(&server->original_stream);
         return false;
     }
-    server->bev_stream.use_dmabuf = FALSE;
+    server->bev_stream.use_dmabuf = TRUE;
     
     GstRTSPMountPoints* mounts = gst_rtsp_server_get_mount_points(server->rtsp_server);
     

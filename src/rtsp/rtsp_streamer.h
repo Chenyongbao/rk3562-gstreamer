@@ -10,7 +10,7 @@
 
 typedef void (*RTSPStreamerReleaseCallback)(void* user_data);
 
-typedef struct {
+typedef struct RTSPStreamer {
     GstElement* appsrc;
     
     int width;

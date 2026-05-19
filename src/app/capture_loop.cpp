@@ -5,33 +5,13 @@
 #include <stdio.h>
 
 #include "config.h"
-#include "video/LatestNv12FrameBuffer.h"
+#include "video/video_frame_types.h"
 
 namespace {
 
 constexpr int kV4L2RecoverAfterFailures = 3;
 
 }  // namespace
-
-// 更新“主摄最新帧”共享缓存，供截图/检测等异步模块读取。
-static void updateMainCameraLatestFrame(const void* data,
-                                        size_t size,
-                                        CaptureLoopState* state)
-{
-    if (!data || !state) {
-        return;
-    }
-
-    if (!main_camera_frame_buffer_update((const uint8_t*)data, size, ++state->main_camera_frame_id)) {
-        static uint64_t main_buffer_update_fail_count = 0;
-        ++main_buffer_update_fail_count;
-        if ((main_buffer_update_fail_count % 300) == 1) {
-            fprintf(stderr, "[MAIN] WARNING: main camera frame buffer update failed (size=%zu, count=%llu)\n",
-                    size, (unsigned long long)main_buffer_update_fail_count);
-        }
-    }
-}
-
 // 每 10 秒输出一次运行统计，便于在线观测吞吐与丢帧情况。
 static void logPeriodicStats(AppContext& app, CaptureLoopState& state)
 {
@@ -127,8 +107,8 @@ void runCaptureLoop(AppContext& app, volatile sig_atomic_t* running)
         }
         consecutive_dequeue_failures = 0;
 
-        // 无论是否有客户端，都维护一份最新主摄帧。
-        updateMainCameraLatestFrame(data, size, &app.capture_state);
+        const bool has_pending_main_camera_refresh =
+            hasPendingMainCameraRefreshRequest(&app.capture_state);
 
         const bool has_original_client = (app.server.original_stream.appsrc != NULL);
         const bool has_bev_client = (app.server.bev_stream.appsrc != NULL);
@@ -136,7 +116,7 @@ void runCaptureLoop(AppContext& app, volatile sig_atomic_t* running)
         const bool has_any_client = (has_original_client || has_bev_client);
 
         // 即使当前没有 RTSP 客户端，也继续更新主摄 latest 帧缓存。
-        if (!has_any_client && !has_forced_bev_refresh) {
+        if (!has_any_client && !has_forced_bev_refresh && !has_pending_main_camera_refresh) {
             app.capture_state.skip_no_client_count++;
             if (app.capture_state.last_has_any_client) {
                 fprintf(stderr, "[MAIN] No clients. Idling...\n");
@@ -162,54 +142,53 @@ void runCaptureLoop(AppContext& app, volatile sig_atomic_t* running)
             app.capture_state.last_has_any_client = false;
         }
 
+        const bool consumed_bev_refresh = consumeBevRefreshRequest(&app.capture_state);
+        const bool force_process = consumed_bev_refresh && !has_bev_client;
         const uint64_t current_frame_idx = dual_rtsp_server_get_next_frame_idx(&app.server);
-        const bool use_dmabuf = (dmabuf_fd >= 0);
-        bool original_holds_v4l2_buffer = false;
 
-        // 原图流只走 DMA-BUF 零拷贝路径，由 worker 处理完后归还 V4L2 buffer。
-        if (has_original_client) {
-            if (use_dmabuf &&
-                frame_queue_push_dmabuf(&app.original_queue, dmabuf_fd, index,
-                                        INPUT_WIDTH, INPUT_HEIGHT, app.cam.y_stride,
-                                        current_frame_idx, &app.cam)) {
-                original_holds_v4l2_buffer = true;
-            } else {
-                if (use_dmabuf) {
-                    static uint64_t original_enqueue_fail_count = 0;
-                    ++original_enqueue_fail_count;
-                    if ((original_enqueue_fail_count % 300) == 1) {
-                        fprintf(stderr, "[MAIN] WARNING: original dmabuf queue push failed (count=%llu)\n",
-                                (unsigned long long)original_enqueue_fail_count);
-                    }
-                } else {
-                    static uint64_t original_non_dmabuf_drop_count = 0;
-                    ++original_non_dmabuf_drop_count;
-                    if ((original_non_dmabuf_drop_count % 300) == 1) {
-                        fprintf(stderr, "[MAIN] WARNING: drop non-dmabuf frame for Original stream (count=%llu)\n",
-                                (unsigned long long)original_non_dmabuf_drop_count);
-                    }
-                }
+        if (app.original_consumer) {
+            app.original_consumer->set_enabled(has_original_client);
+        }
+        if (app.bev_consumer) {
+            app.bev_consumer->set_enabled(has_bev_client || consumed_bev_refresh);
+        }
+
+        VideoFrameDesc frame{};
+        frame.src_dmabuf_fd = dmabuf_fd;
+        frame.width = INPUT_WIDTH;
+        frame.height = INPUT_HEIGHT;
+        frame.stride = app.cam.y_stride;
+        frame.size = size;
+        frame.data = static_cast<const uint8_t*>(data);
+        frame.frame_idx = current_frame_idx;
+        frame.force_process = force_process;
+
+        const VideoRouterDispatchSummary summary = app.video_router.dispatch_frame(frame);
+
+        if (has_original_client &&
+            app.original_consumer &&
+            app.original_consumer->enabled() &&
+            app.original_consumer->last_dispatch_result() == VideoConsumerDispatchResult::kDropped) {
+            static uint64_t original_dispatch_drop_count = 0;
+            ++original_dispatch_drop_count;
+            if ((original_dispatch_drop_count % 300) == 1) {
+                fprintf(stderr,
+                        "[MAIN] WARNING: Original consumer dropped frame (dmabuf_fd=%d, count=%llu)\n",
+                        frame.src_dmabuf_fd,
+                        (unsigned long long)original_dispatch_drop_count);
             }
         }
 
 #ifdef ENABLE_PERFORMANCE_MONITORING
         struct timespec t_bev_push_start, t_bev_push_end;
-        if (has_bev_client) {
+        if (has_bev_client || consumed_bev_refresh) {
             clock_gettime(CLOCK_MONOTONIC, &t_bev_push_start);
         }
 #endif
-        const bool consumed_bev_refresh = consumeBevRefreshRequest(&app.capture_state);
-        if (has_bev_client || consumed_bev_refresh) {
-            const bool force_process = consumed_bev_refresh && !has_bev_client;
-            if (frame_queue_push(&app.bev_queue,
-                                 (const uint8_t*)data,
-                                 size,
-                                 current_frame_idx,
-                                 force_process) && force_process) {
-                fprintf(stderr,
-                        "[MAIN] Forced BEV refresh queued without RTSP client (frame_idx=%llu)\n",
-                        (unsigned long long)current_frame_idx);
-            }
+        if ((has_bev_client || consumed_bev_refresh) && summary.delivered_count > 0 && force_process) {
+            fprintf(stderr,
+                    "[MAIN] Forced BEV refresh queued without RTSP client (frame_idx=%llu)\n",
+                    (unsigned long long)current_frame_idx);
         }
 #ifdef ENABLE_PERFORMANCE_MONITORING
         if (has_bev_client || consumed_bev_refresh) {
@@ -222,10 +201,7 @@ void runCaptureLoop(AppContext& app, volatile sig_atomic_t* running)
             perf_stats_add(&app.perf_main_bev_queue_push, (uint64_t)bev_push_us);
         }
 #endif
-
-        if (!original_holds_v4l2_buffer) {
-            v4l2_camera_queue(&app.cam, index);
-        }
+        v4l2_camera_queue(&app.cam, index);
 
         app.capture_state.frame_count++;
         logPeriodicStats(app, app.capture_state);

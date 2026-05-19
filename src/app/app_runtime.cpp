@@ -13,9 +13,15 @@
 #include "handlers/PingCommandHandler.h"
 #include "handlers/DetectCommandHandler.h"
 #include "handlers/CalibCommandHandler.h"
-#include "handlers/QuitCommandHandler.h"
 #include "stream_workers.h"
 #include "capture_loop.h"
+
+namespace {
+
+constexpr int kOriginalRtspPoolSize = 3;
+constexpr int kBevInputPoolSize = 3;
+
+} // namespace
 
 AppRuntime::AppRuntime(volatile sig_atomic_t* running_flag)
     : running_flag_(running_flag)
@@ -89,13 +95,13 @@ bool AppRuntime::initMediaPipeline()
         return false;
     }
 
-    if (!frame_queue_init(&app_.original_queue, INPUT_WIDTH * INPUT_HEIGHT * 3 / 2)) {
+    if (!frame_queue_init(&app_.original_queue, ORIGINAL_NV12_SIZE)) {
         fprintf(stderr, "[MAIN] ERROR: Original queue init failed\n");
         return false;
     }
     app_.original_queue_initialized = true;
 
-    if (!frame_queue_init(&app_.bev_queue, INPUT_WIDTH * INPUT_HEIGHT * 3 / 2)) {
+    if (!frame_queue_init(&app_.bev_queue, BEV_INPUT_NV12_SIZE)) {
         fprintf(stderr, "[MAIN] ERROR: BEV queue init failed\n");
         return false;
     }
@@ -105,7 +111,6 @@ bool AppRuntime::initMediaPipeline()
     app_.original_ctx.input_queue = &app_.original_queue;
     app_.original_ctx.stream = &app_.server.original_stream;
     app_.original_ctx.bev_processor = NULL;
-    app_.original_ctx.v4l2_cam = &app_.cam;
     app_.original_ctx.running = running_flag_;
     app_.original_ctx.thread_name = "Original-Worker";
     app_.original_ctx.app = &app_;
@@ -114,10 +119,35 @@ bool AppRuntime::initMediaPipeline()
     app_.bev_ctx.input_queue = &app_.bev_queue;
     app_.bev_ctx.stream = &app_.server.bev_stream;
     app_.bev_ctx.bev_processor = app_.server.bev_processor;
-    app_.bev_ctx.v4l2_cam = &app_.cam;
     app_.bev_ctx.running = running_flag_;
     app_.bev_ctx.thread_name = "BEV-Worker";
     app_.bev_ctx.app = &app_;
+
+    app_.original_consumer = std::make_unique<OriginalRtspConsumer>();
+    app_.original_consumer->bind(&app_.original_queue, &app_.server.original_stream, running_flag_);
+    if (!app_.original_consumer->init_pool(kOriginalRtspPoolSize,
+                                           ORIGINAL_WIDTH,
+                                           ORIGINAL_HEIGHT,
+                                           ORIGINAL_WIDTH)) {
+        fprintf(stderr, "[MAIN] ERROR: Original RTSP consumer pool init failed\n");
+        return false;
+    }
+    app_.bev_consumer = std::make_unique<BevRtspConsumer>();
+    app_.bev_consumer->bind(&app_.bev_queue, running_flag_);
+    if (!app_.bev_consumer->init_pool(kBevInputPoolSize,
+                                      BEV_INPUT_WIDTH,
+                                      BEV_INPUT_HEIGHT,
+                                      BEV_INPUT_WIDTH)) {
+        fprintf(stderr, "[MAIN] ERROR: BEV RTSP consumer pool init failed\n");
+        return false;
+    }
+    app_.main_camera_latest_frame_consumer = std::make_unique<MainCameraLatestFrameConsumer>();
+    app_.main_camera_latest_frame_consumer->bind(&app_.capture_state);
+    app_.bev_latest_frame_updater.bind(&app_.capture_state);
+
+    app_.video_router.register_consumer(app_.original_consumer.get());
+    app_.video_router.register_consumer(app_.bev_consumer.get());
+    app_.video_router.register_consumer(app_.main_camera_latest_frame_consumer.get());
 
     return true;
 }
@@ -138,7 +168,6 @@ bool AppRuntime::initCommandServer()
     // 统一命令服务：PING/DETECT/CALIB/QUIT 共用同一端口。
     app_.unified_server = std::make_unique<UnifiedSocketServer>(YOLO_SOCKET_PORT, &app_);
     app_.unified_server->getRouter().registerHandler(std::make_shared<PingCommandHandler>());
-    app_.unified_server->getRouter().registerHandler(std::make_shared<QuitCommandHandler>());
     if (app_.yolo_handle) {
         app_.unified_server->getRouter().registerHandler(std::make_shared<DetectCommandHandler>(app_.yolo_handle));
     } else {
@@ -204,6 +233,10 @@ void AppRuntime::shutdownApp()
         dual_rtsp_server_cleanup(&app_.server);
         app_.rtsp_initialized = false;
     }
+
+    app_.original_consumer.reset();
+    app_.bev_consumer.reset();
+    app_.main_camera_latest_frame_consumer.reset();
 
     if (app_.rga_initialized) {
         rga_processor_cleanup();

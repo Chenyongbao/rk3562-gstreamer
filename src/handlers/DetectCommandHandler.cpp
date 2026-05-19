@@ -2,6 +2,7 @@
 
 #include "../calib/camToolKit/calibData.h"
 #include "../camera_calibreation/klipper/klipper_manager.h"
+#include "../camera_calibreation/totalHigh.h"
 #include "../config.h"
 #include "../reallink_ogles/file_utils.h"
 #include "../tools/WRbin.h"
@@ -322,6 +323,8 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
     // 从共享配置文件中读取焦距和总高，避免不同来源的数据不一致。
     auto loadSharedMetrics = [&]() {
         const std::string conf_path = std::string(REALLINK_CV_CONF_PATH);
+        const std::string bin_path =
+            std::string(CALIB_RESULT_DIR) + "/" + std::string(CALIB_BIN_NAME);
         ReallinkCVConfig config;
         if (!readReallinkCVConf(conf_path, config)) {
             fprintf(stderr, "[Unified Server] WARNING: Failed to read %s\n", conf_path.c_str());
@@ -329,8 +332,15 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
             payload.focal_long = config.focal_long;
             payload.focal_short = config.focal_short;
             payload.focal_ok = true;
-            payload.total_high = config.totalHigh;
+        }
+
+        std::string total_high_error;
+        if (readPersistedTotalHigh(conf_path, bin_path, payload.total_high, &total_high_error)) {
             payload.total_high_ok = true;
+        } else {
+            payload.total_high_ok = false;
+            fprintf(stderr, "[Unified Server] WARNING: Failed to resolve totalHigh: %s\n",
+                    total_high_error.c_str());
         }
     };
 

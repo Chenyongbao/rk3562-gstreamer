@@ -181,6 +181,11 @@ bool v4l2_camera_open(V4L2Camera* cam, const char* device,
     cam->buffer_count = req.count;
     cam->buffers = (void**)calloc(req.count, sizeof(void*));
     cam->buffer_lengths = (size_t*)calloc(req.count, sizeof(size_t));
+    if (!cam->buffers || !cam->buffer_lengths) {
+        fprintf(stderr, "[V4L2] Failed to allocate camera buffers metadata\n");
+        v4l2_camera_close(cam);
+        return false;
+    }
     
     // 
     cam->dmabuf_fds = (int*)calloc(req.count, sizeof(int));

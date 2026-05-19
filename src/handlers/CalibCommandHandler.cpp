@@ -7,6 +7,7 @@
 #include "../camera_calibreation/XYoffset.h"
 #include "../camera_calibreation/totalHigh.h"
 #include "../video/LatestNv12FrameBuffer.h"
+#include "../app/app_context.h"
 #include "../config.h"
 #include "../tools/WRbin.h"
 
@@ -39,6 +40,8 @@ constexpr const char* kMainCalibEmptyDetection = "EMPTY_DETECTION";
 constexpr const char* kMainCalibDetectionCountMismatch = "DETECTION_COUNT_MISMATCH";
 //主摄标定重试次数
 constexpr int kMainCalibMaxAttempts = 3;
+constexpr int kMainCameraRefreshTimeoutMs = 5000;
+constexpr int kMainCameraRefreshPollIntervalMs = 20;
 //主摄结果结构体
 struct MainCameraCalibResult {
     bool success = false;
@@ -235,6 +238,7 @@ bool sendTiltMonitorCommand(bool enable) {
 // ============================================================================
 //截图
 bool captureMainCalibrationFrame(const MainCalibAttemptContext& attempt_ctx,
+                                 CaptureLoopState* capture_state,
                                  int attempt,
                                  std::vector<unsigned char>& nv12_buffer,
                                  size_t& nv12_filled,
@@ -247,8 +251,17 @@ bool captureMainCalibrationFrame(const MainCalibAttemptContext& attempt_ctx,
     nv12_buffer.assign(attempt_ctx.nv12_buf_size, 0);
     nv12_filled = 0;
     frame_id = 0;
-    if (!main_camera_frame_buffer_copy(
-            nv12_buffer.data(), attempt_ctx.nv12_buf_size, &nv12_filled, &frame_id)) {
+    const bool copied = capture_state
+        ? main_camera_frame_buffer_request_fresh_copy(capture_state,
+                                                      nv12_buffer.data(),
+                                                      attempt_ctx.nv12_buf_size,
+                                                      &nv12_filled,
+                                                      &frame_id,
+                                                      kMainCameraRefreshTimeoutMs,
+                                                      kMainCameraRefreshPollIntervalMs)
+        : main_camera_frame_buffer_copy(
+              nv12_buffer.data(), attempt_ctx.nv12_buf_size, &nv12_filled, &frame_id);
+    if (!copied) {
         return false;
     }
 
@@ -324,10 +337,24 @@ CommandResult tryCalibrateMainCamera(CommandContext& ctx,
     int detection_count_mismatch_failures = 0;
 
     for (int attempt = 1; attempt <= kMainCalibMaxAttempts; ++attempt) {
+        std::string fill_light_error;
+        // if (!KlipperManager::instance().setFillLight(255, &fill_light_error)) {
+        //     fprintf(stderr,
+        //             "[Unified Server] Failed to set fill light to 60 before main camera capture: %s\n",
+        //             fill_light_error.c_str());
+        //     ctx.sendErrorResponse("CALIBRATION_FAILED",
+        //                           fill_light_error.empty()
+        //                               ? "Failed to set fill light before main camera capture"
+        //                               : fill_light_error);
+        //     return CommandResult::ERROR_CONTINUE;
+        // }
+
         std::vector<unsigned char> nv12_buffer;
         size_t nv12_filled = 0;
         uint64_t frame_id = 0;
-        if (!captureMainCalibrationFrame(attempt_ctx, attempt, nv12_buffer, nv12_filled, frame_id)) {
+        CaptureLoopState* capture_state = ctx.app ? &ctx.app->capture_state : nullptr;
+        if (!captureMainCalibrationFrame(
+                attempt_ctx, capture_state, attempt, nv12_buffer, nv12_filled, frame_id)) {
             fprintf(stderr, "[Unified Server] Failed to capture valid latest main camera frame\n");
             ctx.sendErrorResponse("CAPTURE_FAILED", "Failed to copy latest main camera frame");
             return CommandResult::ERROR_CONTINUE;
@@ -371,7 +398,7 @@ CommandResult tryCalibrateMainCamera(CommandContext& ctx,
 
 CommandResult handleFocalOnly(CommandContext& ctx) {
     fprintf(stderr, "[Unified Server] Running focal autofocus only (CALIB-FOCALS)\n");
-    Focalabfocal focal_service;
+    Focalabfocal focal_service(ctx.app ? &ctx.app->capture_state : nullptr);
     double focal_long = 0.0;
     double focal_short = 0.0;
     std::string focal_error;
@@ -524,7 +551,7 @@ CommandResult CalibCommandHandler::execute(CommandContext& ctx) {
         fprintf(stderr, "[Unified Server] Starting XYoffset calibration...\n");
         double xy_dxPx = 0.0, xy_dyPx = 0.0;
         std::string xy_error;
-        XYoffsetService xyoffset_service;
+        XYoffsetService xyoffset_service(ctx.app ? &ctx.app->capture_state : nullptr);
         if (!xyoffset_service.calibrate(xy_dxPx, xy_dyPx, xy_error)) {
             fprintf(stderr, "[Unified Server] XYoffset calibration failed: %s\n", xy_error.c_str());
             ctx.sendErrorResponse("CALIBRATION_FAILED", xy_error);

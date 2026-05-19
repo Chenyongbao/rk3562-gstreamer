@@ -53,11 +53,6 @@ bool rtsp_streamer_init(RTSPStreamer* streamer,
         fprintf(stderr, "[RTSP] WARNING: Failed to create DMABUF allocator; DMABUF push may fail.\n");
     }
     
-    // fprintf(stderr, "[RTSP] Streamer initialized: %dx%d @ %dfps\n", 
-    //         width, height, fps);
-    // fprintf(stderr, "[RTSP] Flow control: max_bytes=%zu, max_time=%dms\n",
-    //         max_bytes, max_time_ms);
-    
     return true;
 }
 

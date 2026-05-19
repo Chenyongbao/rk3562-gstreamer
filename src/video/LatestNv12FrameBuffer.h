@@ -6,6 +6,8 @@
 #include <mutex>
 #include <vector>
 
+struct CaptureLoopState;
+
 class LatestNv12FrameBuffer {
 public:
     bool init(int width, int height);
@@ -59,6 +61,20 @@ bool main_camera_frame_buffer_init(int width, int height);
 void main_camera_frame_buffer_cleanup();
 bool main_camera_frame_buffer_update(const uint8_t* nv12_data, size_t size, uint64_t frame_id);
 bool main_camera_frame_buffer_copy(uint8_t* dst, size_t dst_size, size_t* out_size, uint64_t* out_frame_id);
+bool main_camera_frame_buffer_copy_newer_than(uint8_t* dst,
+                                              size_t dst_size,
+                                              size_t* out_size,
+                                              uint64_t* out_frame_id,
+                                              uint64_t min_frame_id,
+                                              int timeout_ms,
+                                              int poll_interval_ms = 10);
+bool main_camera_frame_buffer_request_fresh_copy(CaptureLoopState* state,
+                                                 uint8_t* dst,
+                                                 size_t dst_size,
+                                                 size_t* out_size,
+                                                 uint64_t* out_frame_id,
+                                                 int timeout_ms,
+                                                 int poll_interval_ms = 10);
 int main_camera_frame_buffer_get_width();
 int main_camera_frame_buffer_get_height();
 size_t main_camera_frame_buffer_get_frame_size();

@@ -6,9 +6,12 @@
 
 #include "../config.h"
 
+struct CaptureLoopState;
+
 class XYoffsetService {
 public:
-    explicit XYoffsetService(double targetX = 150.0,
+    explicit XYoffsetService(CaptureLoopState* captureState = nullptr,
+                             double targetX = 150.0,
                              double targetY = 150.0,
                              double mmPerPixel = 0.25,
                              const char* confPath = REALLINK_CV_CONF_PATH);
@@ -32,11 +35,14 @@ private:
     double target_y_;
     double mm_per_pixel_;
     std::string conf_path_;
+    CaptureLoopState* capture_state_ = nullptr;
 
     static constexpr double kDefaultTargetX = 150.0;
     static constexpr double kDefaultTargetY = 150.0;
     static constexpr double kDefaultMmPerPixel = 0.25;
     static constexpr double kFixedCalibZ = 32.0;
+    static constexpr int kMainCameraRefreshTimeoutMs = 5000;
+    static constexpr int kMainCameraRefreshPollIntervalMs = 20;
 
     static constexpr int kDetectFrames = 3;
     static constexpr int kDetectIntervalMs = 200;

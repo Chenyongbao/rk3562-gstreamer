@@ -6,18 +6,16 @@
 #include <stddef.h>
 #include <pthread.h>
 
-
 #define FRAME_QUEUE_SIZE 32
 
+typedef void (*FrameSlotReleaseCallback)(void* user_data, int dmabuf_fd);
 
 typedef struct {
 
     int dmabuf_fd;
-    int v4l2_index;
     int width;
     int height;
     int stride;
-    
 
     uint8_t* buffer;
     size_t size;
@@ -27,6 +25,8 @@ typedef struct {
     bool valid;
     bool is_dmabuf_mode;
     bool force_process;
+    FrameSlotReleaseCallback release_cb;
+    void* release_user_data;
 } FrameSlot;
 
 
@@ -54,10 +54,20 @@ bool frame_queue_init(FrameQueue* queue, size_t buffer_size);
 
 
 bool frame_queue_push_dmabuf(FrameQueue* queue, 
-                             int dmabuf_fd, int v4l2_index,
+                             int dmabuf_fd,
                              int width, int height, int stride,
+                             size_t size,
                              uint64_t frame_idx,
-                             void* v4l2_cam);
+                             bool force_process);
+
+bool frame_queue_push_dmabuf_ex(FrameQueue* queue,
+                                int dmabuf_fd,
+                                int width, int height, int stride,
+                                size_t size,
+                                uint64_t frame_idx,
+                                bool force_process,
+                                FrameSlotReleaseCallback release_cb,
+                                void* release_user_data);
 
 
 bool frame_queue_push(FrameQueue* queue,
@@ -68,6 +78,7 @@ bool frame_queue_push(FrameQueue* queue,
 
 
 FrameSlot* frame_queue_pop_dmabuf(FrameQueue* queue, uint64_t* frame_idx);
+bool frame_queue_pop_copy(FrameQueue* queue, FrameSlot* out_slot, uint64_t* frame_idx);
 
 
 int frame_queue_count(FrameQueue* queue);

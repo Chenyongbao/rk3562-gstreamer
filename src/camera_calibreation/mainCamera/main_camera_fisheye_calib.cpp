@@ -12,6 +12,7 @@
 #include "../../calib/saddleFit.h"
 #include "main_camera_fisheye_calib.h"
 #include "main_camera_default_intrinsics.h"
+#include "main_camera_default_intrinsics_refinement.h"
 #include "../../calib/camToolKit/calibData.h"
 #include "../../calib/camToolKit/calib_eeprom.h"
 #include "../../reallink_ogles/camera.h"
@@ -22,6 +23,38 @@ namespace {
 
 constexpr double kMainCameraEepromK3Min = -0.2;
 constexpr double kMainCameraEepromK4Max = 0.2;
+
+std::string formatCalibDataIntrinsicsSummary(const CalibData& calibData)
+{
+    std::ostringstream oss;
+    oss << "fx=" << calibData.fx
+        << " fy=" << calibData.fy
+        << " cx=" << calibData.cx
+        << " cy=" << calibData.cy
+        << " k1=" << calibData.distCoeffs[0]
+        << " k2=" << calibData.distCoeffs[1]
+        << " k3=" << calibData.distCoeffs[2]
+        << " k4=" << calibData.distCoeffs[3];
+    return oss.str();
+}
+
+std::string formatRuntimeCandidateSummary(const cv::Mat& cameraMatrix, const cv::Mat& distCoeffs)
+{
+    if (cameraMatrix.empty() || distCoeffs.empty()) {
+        return "unavailable";
+    }
+
+    std::ostringstream oss;
+    oss << "fx=" << cameraMatrix.at<double>(0, 0)
+        << " fy=" << cameraMatrix.at<double>(1, 1)
+        << " cx=" << cameraMatrix.at<double>(0, 2)
+        << " cy=" << cameraMatrix.at<double>(1, 2)
+        << " k1=" << distCoeffs.at<double>(0, 0)
+        << " k2=" << distCoeffs.at<double>(1, 0)
+        << " k3=" << distCoeffs.at<double>(2, 0)
+        << " k4=" << distCoeffs.at<double>(3, 0);
+    return oss.str();
+}
 
 bool computeFisheyeReprojectionRms(const std::vector<cv::Point3f>& objectPoints,
                                    const std::vector<cv::Point2f>& imagePoints,
@@ -345,6 +378,7 @@ MainCameraFisheyeCalibResult MainCameraFisheyeCalibrator::calibrateFromNv12(cons
         cv::Vec3d rvec;
         cv::Vec3d tvec;
         double reprojectionRms = std::numeric_limits<double>::quiet_NaN();
+        const char* intrinsicsMode = "unknown";
 
         // 4) 鞍点优化：角点亚像素精修，提高标定稳定性。
         std::cout << "[MainCameraCalib] frame_id=" << frame_id << " saddle_begin" << std::endl;
@@ -364,28 +398,76 @@ MainCameraFisheyeCalibResult MainCameraFisheyeCalibrator::calibrateFromNv12(cons
                 return {false, "EEPROM_READ_FAILED"};
             }
 
+            std::cout << "[MainCameraCalib] frame_id=" << frame_id
+                      << " EEPROM intrinsics raw"
+                      << " " << formatCalibDataIntrinsicsSummary(calibData)
+                      << std::endl;
+
             const CalibData* activeCalibData = &calibData;
             CalibData defaultCalibData{};
+            bool usedDefaultCxCyRefinement = false;
             if (!isEepromDistortionAcceptable(calibData)) {
                 defaultCalibData = makeDefaultMainCameraCalibData(imageWidth, imageHeight);
-                activeCalibData = &defaultCalibData;
                 std::cout << "[MainCameraCalib] frame_id=" << frame_id
                           << " EEPROM distortion rejected, using default intrinsics"
                           << " k3=" << calibData.distCoeffs[2]
                           << " k4=" << calibData.distCoeffs[3]
                           << std::endl;
 
+                MainCameraDefaultIntrinsicsRefinementResult refinementResult;
+                if (!refineMainCameraDefaultIntrinsicsCxCyOnly(objectPoints,
+                                                               imagePoints,
+                                                               imageWidth,
+                                                               imageHeight,
+                                                               defaultCalibData,
+                                                               refinementResult)) {
+                    std::cerr << "[MainCameraCalib] frame_id=" << frame_id
+                              << " failed to refine default principal point: "
+                              << refinementResult.error << std::endl;
+                    saveDebugArtifacts(std::numeric_limits<double>::quiet_NaN(),
+                                       std::string("default-cxy-refine-failed: ") + refinementResult.error,
+                                       chessboardResults);
+                    return {false, "DEFAULT_CXY_REFINE_FAILED"};
+                }
+
+                usedDefaultCxCyRefinement = true;
+                intrinsicsMode = "default_intrinsics_cxy_refined";
+                defaultCalibData.cx = refinementResult.refinedCx;
+                defaultCalibData.cy = refinementResult.refinedCy;
+                defaultCalibData.checksum = calibdata_calc_checksum(&defaultCalibData);
                 if (!eeprom.write(defaultCalibData)) {
                     std::cerr << "[MainCameraCalib] frame_id=" << frame_id
-                              << " failed to write default intrinsics to EEPROM" << std::endl;
+                              << " failed to write fallback intrinsics to EEPROM" << std::endl;
                     saveDebugArtifacts(std::numeric_limits<double>::quiet_NaN(),
                                        "eeprom-write-default-failed",
                                        chessboardResults);
                     return {false, "EEPROM_WRITE_DEFAULT_FAILED"};
                 }
+                activeCalibData = &defaultCalibData;
+                cameraMatrix = refinementResult.cameraMatrix.clone();
+                distCoeffs = refinementResult.distCoeffs.clone();
+                rvec = refinementResult.rvec;
+                tvec = refinementResult.tvec;
+                reprojectionRms = refinementResult.rms;
+
                 std::cout << "[MainCameraCalib] frame_id=" << frame_id
-                          << " default intrinsics written to EEPROM" << std::endl;
+                          << " default intrinsics cx/cy refined"
+                          << " refined_cx=" << defaultCalibData.cx
+                          << " refined_cy=" << defaultCalibData.cy
+                          << " rms=" << reprojectionRms
+                          << " fixed_distortion_preserved="
+                          << (refinementResult.fixedDistortionPreserved ? "true" : "false")
+                          << std::endl;
+                std::cout << "[MainCameraCalib] frame_id=" << frame_id
+                          << " vendored fisheye calibrate path active"
+                          << " " << formatCalibDataIntrinsicsSummary(defaultCalibData)
+                          << std::endl;
+                std::cout << "[MainCameraCalib] frame_id=" << frame_id
+                          << " fallback intrinsics written to EEPROM"
+                          << " " << formatCalibDataIntrinsicsSummary(defaultCalibData)
+                          << std::endl;
             } else {
+                intrinsicsMode = "eeprom_extrinsics_only";
                 std::cout << "[MainCameraCalib] frame_id=" << frame_id
                           << " EEPROM distortion accepted, using EEPROM intrinsics"
                           << " k3=" << calibData.distCoeffs[2]
@@ -393,38 +475,40 @@ MainCameraFisheyeCalibResult MainCameraFisheyeCalibrator::calibrateFromNv12(cons
                           << std::endl;
             }
 
-            cameraMatrix = (cv::Mat_<double>(3, 3) <<
-                activeCalibData->fx, 0.0, activeCalibData->cx,
-                0.0, activeCalibData->fy, activeCalibData->cy,
-                0.0, 0.0, 1.0);
-            distCoeffs = (cv::Mat_<double>(4, 1) <<
-                activeCalibData->distCoeffs[0],
-                activeCalibData->distCoeffs[1],
-                activeCalibData->distCoeffs[2],
-                activeCalibData->distCoeffs[3]);
+            if (!usedDefaultCxCyRefinement) {
+                cameraMatrix = (cv::Mat_<double>(3, 3) <<
+                    activeCalibData->fx, 0.0, activeCalibData->cx,
+                    0.0, activeCalibData->fy, activeCalibData->cy,
+                    0.0, 0.0, 1.0);
+                distCoeffs = (cv::Mat_<double>(4, 1) <<
+                    activeCalibData->distCoeffs[0],
+                    activeCalibData->distCoeffs[1],
+                    activeCalibData->distCoeffs[2],
+                    activeCalibData->distCoeffs[3]);
 
-            std::vector<cv::Point2f> undistortedImagePoints;
-            cv::fisheye::undistortPoints(imagePoints,
-                                         undistortedImagePoints,
-                                         cameraMatrix,
-                                         distCoeffs);
+                std::vector<cv::Point2f> undistortedImagePoints;
+                cv::fisheye::undistortPoints(imagePoints,
+                                             undistortedImagePoints,
+                                             cameraMatrix,
+                                             distCoeffs);
 
-            const bool solved = cv::solvePnP(
-                objectPoints,
-                undistortedImagePoints,
-                cv::Mat::eye(3, 3, CV_64F),
-                cv::noArray(),
-                rvec,
-                tvec,
-                false,
-                cv::SOLVEPNP_ITERATIVE);
-            if (!solved) {
-                std::cerr << "[MainCameraCalib] frame_id=" << frame_id
-                          << " fisheye solvePnP returned false" << std::endl;
-                saveDebugArtifacts(std::numeric_limits<double>::quiet_NaN(),
-                                   "solvepnp-failed",
-                                   chessboardResults);
-                return {false, "SOLVEPNP_FAILED"};
+                const bool solved = cv::solvePnP(
+                    objectPoints,
+                    undistortedImagePoints,
+                    cv::Mat::eye(3, 3, CV_64F),
+                    cv::noArray(),
+                    rvec,
+                    tvec,
+                    false,
+                    cv::SOLVEPNP_ITERATIVE);
+                if (!solved) {
+                    std::cerr << "[MainCameraCalib] frame_id=" << frame_id
+                              << " fisheye solvePnP returned false" << std::endl;
+                    saveDebugArtifacts(std::numeric_limits<double>::quiet_NaN(),
+                                       "solvepnp-failed",
+                                       chessboardResults);
+                    return {false, "SOLVEPNP_FAILED"};
+                }
             }
         } catch (const cv::Exception& e) {
             std::cerr << "[MainCameraCalib] frame_id=" << frame_id
@@ -472,9 +556,13 @@ MainCameraFisheyeCalibResult MainCameraFisheyeCalibrator::calibrateFromNv12(cons
         std::cout << "[MainCameraCalib] tvec=" << tvec << std::endl;
         std::cout << "[MainCameraCalib] reprojection_rms=" << reprojectionRms
                   << " px, points=" << imagePoints.size() << std::endl;
+        std::cout << "[MainCameraCalib] intrinsics_mode=" << intrinsicsMode << std::endl;
+        std::cout << "[MainCameraCalib] runtime_candidate "
+                  << formatRuntimeCandidateSummary(cameraMatrix, distCoeffs) << std::endl;
         std::cout << "[MainCameraCalib] cameraMatrix=" << cameraMatrix << std::endl;
         std::cout << "[MainCameraCalib] distCoeffs=" << distCoeffs << std::endl;
-        std::cout << "[MainCameraCalib] intrinsics source=EEPROM, extrinsics solved only" << std::endl;
+        std::cout << "[MainCameraCalib] intrinsics_resolution_summary mode="
+                  << intrinsicsMode << std::endl;
 
         {
             ReallinkCVConfig config{};

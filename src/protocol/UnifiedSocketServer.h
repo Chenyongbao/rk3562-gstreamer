@@ -5,8 +5,6 @@
 #include <thread>
 #include <atomic>
 #include <memory>
-#include <vector>
-#include <mutex>
 #include <sys/socket.h>
 #include <sys/select.h>
 #include <netinet/in.h>
@@ -22,8 +20,6 @@ private:
     int port_;
     int server_fd_;
     std::thread server_thread_;
-    std::vector<std::thread> client_threads_;
-    std::mutex client_threads_mutex_;
     std::atomic<bool> running_;
     AppContext* app_;
     
