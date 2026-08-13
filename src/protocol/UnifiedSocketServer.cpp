@@ -56,16 +56,6 @@ void UnifiedSocketServer::stop() {
             server_thread_.join();
         }
     }
-
-    {
-        std::lock_guard<std::mutex> lock(client_threads_mutex_);
-        for (auto& thread : client_threads_) {
-            if (thread.joinable()) {
-                thread.join();
-            }
-        }
-        client_threads_.clear();
-    }
     
     if (server_fd_ >= 0) {
         close(server_fd_);
@@ -108,13 +98,7 @@ void UnifiedSocketServer::serverLoop() {
         inet_ntop(AF_INET, &client_addr.sin_addr, ip_str, sizeof(ip_str));
         
         // 处理客户端连接（同步模式）
-        {
-            std::lock_guard<std::mutex> lock(client_threads_mutex_);
-            client_threads_.emplace_back(&UnifiedSocketServer::handleClientConnection,
-                                         this,
-                                         client_fd,
-                                         std::string(ip_str));
-        }
+        handleClientConnection(client_fd, ip_str);
     }
     
     fprintf(stderr, "[UnifiedServer] Server loop stopped\n");

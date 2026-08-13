@@ -13,7 +13,15 @@
 using namespace std;
 
 
-static bool createDmaTexture(GLContext& ctx, const dma_buffer_t& dma_buf, GLuint& texture_id, EGLImageKHR& egl_image, uint32_t drm_format) {
+static bool createDmaTexture(GLContext& ctx,
+                             int fd,
+                             int width,
+                             int height,
+                             int stride,
+                             size_t offset,
+                             GLuint& texture_id,
+                             EGLImageKHR& egl_image,
+                             uint32_t drm_format) {
     PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR = 
         (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
     PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES =
@@ -33,12 +41,12 @@ static bool createDmaTexture(GLContext& ctx, const dma_buffer_t& dma_buf, GLuint
     
 
     EGLint attribs[] = {
-        EGL_WIDTH, dma_buf.width,
-        EGL_HEIGHT, dma_buf.height,
+        EGL_WIDTH, width,
+        EGL_HEIGHT, height,
         EGL_LINUX_DRM_FOURCC_EXT, (EGLint)drm_format,
-        EGL_DMA_BUF_PLANE0_FD_EXT, dma_buf.fd,
-        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
-        EGL_DMA_BUF_PLANE0_PITCH_EXT, dma_buf.stride,
+        EGL_DMA_BUF_PLANE0_FD_EXT, fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)offset,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, stride,
         EGL_NONE
     };
     
@@ -52,7 +60,7 @@ static bool createDmaTexture(GLContext& ctx, const dma_buffer_t& dma_buf, GLuint
 
 
         fprintf(stderr, "  Debug: eglCreateImageKHR failed for format 0x%x: 0x%x (size=%dx%d) - trying fallback\n", 
-                drm_format, egl_error, dma_buf.width, dma_buf.height);
+                drm_format, egl_error, width, height);
         glDeleteTextures(1, &texture_id);
         return false;
     }
@@ -81,6 +89,34 @@ static bool createDmaTexture(GLContext& ctx, const dma_buffer_t& dma_buf, GLuint
     return true;
 }
 
+static void destroyInputTextures(GLContext& ctx) {
+    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR =
+        (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+
+    if (ctx.input_texture_y != 0) {
+        glDeleteTextures(1, &ctx.input_texture_y);
+        ctx.input_texture_y = 0;
+    }
+    if (ctx.input_texture_uv != 0) {
+        glDeleteTextures(1, &ctx.input_texture_uv);
+        ctx.input_texture_uv = 0;
+    }
+
+    if (eglDestroyImageKHR) {
+        if (ctx.egl_image_input_y != EGL_NO_IMAGE_KHR) {
+            eglDestroyImageKHR(ctx.display, ctx.egl_image_input_y);
+            ctx.egl_image_input_y = EGL_NO_IMAGE_KHR;
+        }
+        if (ctx.egl_image_input_uv != EGL_NO_IMAGE_KHR) {
+            eglDestroyImageKHR(ctx.display, ctx.egl_image_input_uv);
+            ctx.egl_image_input_uv = EGL_NO_IMAGE_KHR;
+        }
+    }
+
+    ctx.uv_uses_rg88_format = false;
+    ctx.input_uses_external_dmabuf = false;
+}
+
 
 bool initDmaInputBuffers(GLContext& ctx, int width, int height) {
 
@@ -106,6 +142,74 @@ bool initDmaInputBuffers(GLContext& ctx, int width, int height) {
         return false;
     }
     
+    return true;
+}
+
+bool uploadNV12DmabufTextures(GLContext& ctx,
+                              int nv12_fd,
+                              int width,
+                              int height,
+                              int stride,
+                              size_t size) {
+    if (nv12_fd < 0 || width <= 0 || height <= 0 || stride < width) {
+        return false;
+    }
+
+    const size_t y_size = static_cast<size_t>(stride) * static_cast<size_t>(height);
+    const size_t uv_size = y_size / 2;
+    if (size < y_size + uv_size) {
+        return false;
+    }
+
+    destroyInputTextures(ctx);
+
+    const uint32_t drm_r8 = 0x20203852;
+    if (!createDmaTexture(ctx,
+                          nv12_fd,
+                          width,
+                          height,
+                          stride,
+                          0,
+                          ctx.input_texture_y,
+                          ctx.egl_image_input_y,
+                          drm_r8)) {
+        destroyInputTextures(ctx);
+        return false;
+    }
+
+    const int uv_width = width / 2;
+    const int uv_height = height / 2;
+    const uint32_t gr88 = (('G' << 0) | ('R' << 8) | ('8' << 16) | ('8' << 24));
+    const uint32_t rg88 = (('R' << 0) | ('G' << 8) | ('8' << 16) | ('8' << 24));
+    
+    const bool prefer_rg88 = ctx.input_uv_prefers_rg88;
+    const uint32_t preferred_uv_format = prefer_rg88 ? rg88 : gr88;
+    const uint32_t fallback_uv_format = prefer_rg88 ? gr88 : rg88;
+    if (!createDmaTexture(ctx,
+                          nv12_fd,
+                          uv_width,
+                          uv_height,
+                          stride,
+                          y_size,
+                          ctx.input_texture_uv,
+                          ctx.egl_image_input_uv,
+                          preferred_uv_format)) {
+        if (!createDmaTexture(ctx,
+                              nv12_fd,
+                              uv_width,
+                              uv_height,
+                              stride,
+                              y_size,
+                              ctx.input_texture_uv,
+                              ctx.egl_image_input_uv,
+                              fallback_uv_format)) {
+            destroyInputTextures(ctx);
+            return false;
+        }
+        ctx.input_uv_prefers_rg88 = !prefer_rg88;
+    }
+
+    ctx.input_uses_external_dmabuf = true;
     return true;
 }
 
@@ -258,6 +362,10 @@ bool uploadNV12Textures(GLContext& ctx, const vector<uint8_t>& nv12_data, int wi
     auto start = chrono::high_resolution_clock::now();
     
 
+    if (ctx.input_uses_external_dmabuf) {
+        destroyInputTextures(ctx);
+    }
+
 
     const uint8_t* data_ptr = (nv12_data_ptr != nullptr) ? nv12_data_ptr : 
                               (nv12_data.empty() ? nullptr : nv12_data.data());
@@ -330,7 +438,12 @@ bool uploadNV12Textures(GLContext& ctx, const vector<uint8_t>& nv12_data, int wi
             
 
             // DRM_FORMAT_R8 = fourcc_code('R', '8', ' ', ' ') = 0x20203852
-            if (createDmaTexture(ctx, ctx.dma_input_y, ctx.input_texture_y, 
+            if (createDmaTexture(ctx, ctx.dma_input_y.fd,
+                                 ctx.dma_input_y.width,
+                                 ctx.dma_input_y.height,
+                                 ctx.dma_input_y.stride,
+                                 0,
+                                 ctx.input_texture_y,
                                  ctx.egl_image_input_y, 0x20203852)) {
                 use_dma_y = true;
             } else {
@@ -371,14 +484,24 @@ bool uploadNV12Textures(GLContext& ctx, const vector<uint8_t>& nv12_data, int wi
                 
 
 
-                if (createDmaTexture(ctx, ctx.dma_input_uv, ctx.input_texture_uv,
+                if (createDmaTexture(ctx, ctx.dma_input_uv.fd,
+                                    ctx.dma_input_uv.width,
+                                    ctx.dma_input_uv.height,
+                                    ctx.dma_input_uv.stride,
+                                    0,
+                                    ctx.input_texture_uv,
                                     ctx.egl_image_input_uv, gr88)) {
                     use_dma_uv = true;
                     cout << "  UV DMA texture created with DRM_FORMAT_GR88 (0x" << hex << gr88 << dec << ")" << endl;
                 } else {
 
 
-                    if (createDmaTexture(ctx, ctx.dma_input_uv, ctx.input_texture_uv,
+                    if (createDmaTexture(ctx, ctx.dma_input_uv.fd,
+                                        ctx.dma_input_uv.width,
+                                        ctx.dma_input_uv.height,
+                                        ctx.dma_input_uv.stride,
+                                        0,
+                                        ctx.input_texture_uv,
                                         ctx.egl_image_input_uv, rg88)) {
                         use_dma_uv = true;
                         ctx.uv_uses_rg88_format = true;
@@ -408,10 +531,20 @@ bool uploadNV12Textures(GLContext& ctx, const vector<uint8_t>& nv12_data, int wi
             uint32_t gr88 = (('G' << 0) | ('R' << 8) | ('8' << 16) | ('8' << 24));
             uint32_t rg88 = (('R' << 0) | ('G' << 8) | ('8' << 16) | ('8' << 24));
             
-            if (createDmaTexture(ctx, ctx.dma_input_uv, ctx.input_texture_uv,
+            if (createDmaTexture(ctx, ctx.dma_input_uv.fd,
+                                ctx.dma_input_uv.width,
+                                ctx.dma_input_uv.height,
+                                ctx.dma_input_uv.stride,
+                                0,
+                                ctx.input_texture_uv,
                                 ctx.egl_image_input_uv, gr88)) {
                 cout << "  UV DMA texture created with DRM_FORMAT_GR88 (0x" << hex << gr88 << dec << ")" << endl;
-            } else if (createDmaTexture(ctx, ctx.dma_input_uv, ctx.input_texture_uv,
+            } else if (createDmaTexture(ctx, ctx.dma_input_uv.fd,
+                                       ctx.dma_input_uv.width,
+                                       ctx.dma_input_uv.height,
+                                       ctx.dma_input_uv.stride,
+                                       0,
+                                       ctx.input_texture_uv,
                                        ctx.egl_image_input_uv, rg88)) {
                 ctx.uv_uses_rg88_format = true;
                 cout << "  UV DMA texture created with DRM_FORMAT_RG88 (0x" << hex << rg88 << dec << ")" << endl;
@@ -420,7 +553,12 @@ bool uploadNV12Textures(GLContext& ctx, const vector<uint8_t>& nv12_data, int wi
         
 
         if (use_dma_y && ctx.egl_image_input_y == EGL_NO_IMAGE_KHR) {
-            if (createDmaTexture(ctx, ctx.dma_input_y, ctx.input_texture_y, 
+            if (createDmaTexture(ctx, ctx.dma_input_y.fd,
+                                 ctx.dma_input_y.width,
+                                 ctx.dma_input_y.height,
+                                 ctx.dma_input_y.stride,
+                                 0,
+                                 ctx.input_texture_y,
                                  ctx.egl_image_input_y, 0x20203852)) {
                 cout << "  Y DMA texture created" << endl;
             }

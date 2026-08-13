@@ -1,6 +1,7 @@
 #include "thickness.h"
 
-#include "../camera_calibreation/klipper/klipper_manager.h"
+#include "../camera_calibreation/totalHigh.h"
+#include "../klipper/klipper_manager.h"
 #include "../reallink_ogles/camera.h"
 #include "../reallink_ogles/file_utils.h"
 
@@ -349,13 +350,12 @@ bool ThicknessService::measureFromYolo(const YOLOFrameResult& yolo_result,
             // 物料表面高度 = 探测距离 + Z 轴下探量。
             result.measured_height_mm = result.distance_mm + result.z_drop_mm;
 
-            ReallinkCVConfig config;
-            if (!readReallinkCVConf(conf_path_, config)) {
-                errorMsg = "Failed to read config file: " + conf_path_;
+            const std::string bin_path =
+                std::string(CALIB_RESULT_DIR) + "/" + std::string(CALIB_BIN_NAME);
+            if (!readPersistedTotalHigh(conf_path_, bin_path, result.total_high_mm, &errorMsg)) {
                 break;
             }
 
-            result.total_high_mm = config.totalHigh;
             if (std::fabs(result.total_high_mm) <= kTotalHighZeroEps) {
                 errorMsg = "Invalid totalHigh (0), abort thickness calculation";
                 break;

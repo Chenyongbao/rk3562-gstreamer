@@ -3,7 +3,7 @@
 
 #include <signal.h>
 
-#include "app_context.h"
+#include "app/app_context.h"
 
 // 应用运行时封装：负责初始化、运行主循环和统一清理。
 class AppRuntime {

@@ -68,6 +68,8 @@ struct GLContext {
     EGLImageKHR egl_image_input_y;
     EGLImageKHR egl_image_input_uv;
     bool uv_uses_rg88_format;
+    bool input_uv_prefers_rg88;
+    bool input_uses_external_dmabuf;
     
 
     GLuint shader_program_y;
@@ -115,6 +117,13 @@ bool writeNV12ToDmaBuffers(GLContext& ctx, const std::vector<uint8_t>& nv12_data
 
 
 bool writeNV12ToDmaBuffersPtr(GLContext& ctx, const uint8_t* nv12_data_ptr, int width, int height);
+
+bool uploadNV12DmabufTextures(GLContext& ctx,
+                              int nv12_fd,
+                              int width,
+                              int height,
+                              int stride,
+                              size_t size);
 
 
 

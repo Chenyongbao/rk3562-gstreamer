@@ -1,7 +1,7 @@
 #ifndef CONFIG_H
 #define CONFIG_H
 
-#define REALLINKCV_VERSION "1.1"
+#define REALLINKCV_VERSION "0.9"
 
 #define V4L2_DEVICE       "/dev/video11"
 #define INPUT_WIDTH       4224

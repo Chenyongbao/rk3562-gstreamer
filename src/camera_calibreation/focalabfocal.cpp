@@ -1,13 +1,15 @@
 #define _USE_MATH_DEFINES
 
 #include "focalabfocal.h"
+#include "focal_range_normalizer.h"
 
 #include "../config.h"
 #include "../reallink_ogles/bev_api.h"
 
+#include "../app/capture_state.h"
 #include "../reallink_ogles/file_utils.h"
-#include "../video/LatestNv12FrameBuffer.h"
-#include "klipper/klipper_manager.h"
+#include "../pipeline/3_consumers/common/LatestNv12FrameBuffer.h"
+#include "../klipper/klipper_manager.h"
 
 #include <algorithm>
 #include <chrono>
@@ -107,18 +109,6 @@ static constexpr double kMinAcceptedFocusSpotArea = 100.0;
 static constexpr int kBlueSpotMinValue = 45;
 static constexpr const char* kFocusState1Label = "state1";
 static constexpr const char* kFocusState2Label = "state2";
-static constexpr double kNewProjectorShortMin = 6.0;
-static constexpr double kNewProjectorShortMax = 10.0;
-static constexpr double kNewProjectorShortFallback = 8.0;
-static constexpr double kNewProjectorLongMin = 10.0;
-static constexpr double kNewProjectorLongMax = 14.0;
-static constexpr double kNewProjectorLongFallback = 12.0;
-static constexpr double kOldProjectorLongMin = 13.0;
-static constexpr double kOldProjectorLongMax = 17.0;
-static constexpr double kOldProjectorLongFallback = 15.0;
-static constexpr double kOldProjectorShortMin = 9.0;
-static constexpr double kOldProjectorShortMax = 13.0;
-static constexpr double kOldProjectorShortFallback = 11.0;
 
 static void setError(std::string& out, const std::string& msg) {
     if (out.empty()) {
@@ -135,62 +125,6 @@ static const char* machineTypeName(FocalMachineType type) {
     default:
         return "unknown";
     }
-}
-
-static bool isStrictlyBetween(double value, double lo, double hi) {
-    return std::isfinite(value) && value > lo && value < hi;
-}
-
-static void clampFocusValue(const char* label,
-                            double min_value,
-                            double max_value,
-                            double fallback_value,
-                            double& value) {
-    if (isStrictlyBetween(value, min_value, max_value)) {
-        return;
-    }
-    std::fprintf(stderr,
-                 "[FocalAutoFocus] %s focal %.3f outside (%.3f, %.3f), forcing fallback %.3f\n",
-                 label ? label : "unknown",
-                 value,
-                 min_value,
-                 max_value,
-                 fallback_value);
-    value = fallback_value;
-}
-
-static void normalizeMeasuredFocalsByMachineType(FocalAutoFocusResult& result) {
-    switch (result.machine_type) {
-    case FocalMachineType::NewProjector:
-        clampFocusValue("new/short",
-                        kNewProjectorShortMin,
-                        kNewProjectorShortMax,
-                        kNewProjectorShortFallback,
-                        result.focal_short);
-        clampFocusValue("new/long",
-                        kNewProjectorLongMin,
-                        kNewProjectorLongMax,
-                        kNewProjectorLongFallback,
-                        result.focal_long);
-        break;
-    case FocalMachineType::OldProjector:
-        clampFocusValue("old/short",
-                        kOldProjectorShortMin,
-                        kOldProjectorShortMax,
-                        kOldProjectorShortFallback,
-                        result.focal_short);
-        clampFocusValue("old/long",
-                        kOldProjectorLongMin,
-                        kOldProjectorLongMax,
-                        kOldProjectorLongFallback,
-                        result.focal_long);
-        break;
-    default:
-        break;
-    }
-
-    result.short_focus.focal_distance_mm = result.focal_short;
-    result.long_focus.focal_distance_mm = result.focal_long;
 }
 
 static bool isFrameCorrupted(const cv::Mat& bgr) {
@@ -563,6 +497,9 @@ static SpotResult detectSpot(const cv::Mat& image) {
 
 class FocalFrameSource {
 public:
+    explicit FocalFrameSource(CaptureLoopState* capture_state = nullptr)
+        : capture_state_(capture_state) {}
+
     ~FocalFrameSource() {
         if (bev_handle_) {
             bev_cleanup(bev_handle_);
@@ -590,7 +527,16 @@ public:
     bool grabBgrFrame(cv::Mat& out_bgr, std::string& error, uint64_t* out_frame_id = nullptr) {
         size_t filled = 0;
         uint64_t frame_id = 0;
-        if (!main_camera_frame_buffer_copy(main_nv12_.data(), main_nv12_.size(), &filled, &frame_id)) {
+        const bool copied = capture_state_
+            ? main_camera_frame_buffer_request_fresh_copy(capture_state_,
+                                                          main_nv12_.data(),
+                                                          main_nv12_.size(),
+                                                          &filled,
+                                                          &frame_id,
+                                                          5000,
+                                                          20)
+            : main_camera_frame_buffer_copy(main_nv12_.data(), main_nv12_.size(), &filled, &frame_id);
+        if (!copied) {
             error = "Failed to copy latest main camera frame";
             return false;
         }
@@ -648,6 +594,7 @@ private:
     std::vector<uint8_t> main_nv12_;
     std::vector<uint8_t> bev_nv12_;
     BevHandle bev_handle_ = nullptr;
+    CaptureLoopState* capture_state_ = nullptr;
 };
 
 static bool grabScoredFrame(FocalFrameSource& frames,
@@ -1073,11 +1020,14 @@ FocalAutoFocusConfig::FocalAutoFocusConfig() {
     };
 }
 
-Focalabfocal::Focalabfocal()
-    : config_() {}
+Focalabfocal::Focalabfocal(CaptureLoopState* capture_state)
+    : config_(),
+      capture_state_(capture_state) {}
 
-Focalabfocal::Focalabfocal(const FocalAutoFocusConfig& config)
-    : config_(config) {
+Focalabfocal::Focalabfocal(const FocalAutoFocusConfig& config,
+                           CaptureLoopState* capture_state)
+    : config_(config),
+      capture_state_(capture_state) {
     if (!config_.conf_path) {
         config_.conf_path = REALLINK_CV_CONF_PATH;
     }
@@ -1089,7 +1039,7 @@ Focalabfocal::Focalabfocal(const FocalAutoFocusConfig& config)
 bool Focalabfocal::runAutoFocus(FocalAutoFocusResult& result) {
     result = FocalAutoFocusResult{};
 
-    FocalFrameSource frames;
+    FocalFrameSource frames(capture_state_);
     if (!frames.init(result.error)) {
         return false;
     }
@@ -1198,7 +1148,7 @@ bool Focalabfocal::runAutoFocus(FocalAutoFocusResult& result) {
 
     result.focal_short = result.short_focus.focal_distance_mm;
     result.focal_long = result.long_focus.focal_distance_mm;
-    normalizeMeasuredFocalsByMachineType(result);
+    normalizeFocalResultForNewProjectorRanges(result);
     result.success = true;
     return true;
 }
@@ -1238,7 +1188,7 @@ bool Focalabfocal::runAutoFocusAndSave(double& focal_long,
 }
 
 bool Focalabfocal::measureLongFocus(FocalFocusResult& result) {
-    FocalFrameSource frames;
+    FocalFrameSource frames(capture_state_);
     std::string error;
     if (!frames.init(error)) {
         result = FocalFocusResult{};
@@ -1252,7 +1202,7 @@ bool Focalabfocal::measureLongFocus(FocalFocusResult& result) {
 }
 
 bool Focalabfocal::measureShortFocus(FocalFocusResult& result) {
-    FocalFrameSource frames;
+    FocalFrameSource frames(capture_state_);
     std::string error;
     if (!frames.init(error)) {
         result = FocalFocusResult{};

@@ -16,17 +16,20 @@
 #include "../config.h"
 #include "../reallink_ogles/camera.h"
 #include "../reallink_ogles/file_utils.h"
-#include "../video/LatestNv12FrameBuffer.h"
-#include "klipper/klipper_manager.h"
+#include "../pipeline/3_consumers/common/LatestNv12FrameBuffer.h"
+#include "../app/capture_state.h"
+#include "../klipper/klipper_manager.h"
 
-XYoffsetService::XYoffsetService(double targetX,
+XYoffsetService::XYoffsetService(CaptureLoopState* captureState,
+                                 double targetX,
                                  double targetY,
                                  double mmPerPixel,
                                  const char* confPath)
     : target_x_(targetX > 0 ? targetX : kDefaultTargetX),
       target_y_(targetY > 0 ? targetY : kDefaultTargetY),
       mm_per_pixel_(mmPerPixel > 0 ? mmPerPixel : kDefaultMmPerPixel),
-      conf_path_(confPath ? confPath : REALLINK_CV_CONF_PATH) {}
+      conf_path_(confPath ? confPath : REALLINK_CV_CONF_PATH),
+      capture_state_(captureState) {}
 
 //截图nv12转jpg
 bool XYoffsetService::captureImage(cv::Mat& out, std::string& errorMsg) const {
@@ -38,7 +41,16 @@ bool XYoffsetService::captureImage(cv::Mat& out, std::string& errorMsg) const {
     size_t outSize = 0;
     uint64_t frameId = 0;
 
-    if (!main_camera_frame_buffer_copy(buffer.data(), frameSize, &outSize, &frameId)) {
+    const bool copied = capture_state_
+        ? main_camera_frame_buffer_request_fresh_copy(capture_state_,
+                                                      buffer.data(),
+                                                      frameSize,
+                                                      &outSize,
+                                                      &frameId,
+                                                      kMainCameraRefreshTimeoutMs,
+                                                      kMainCameraRefreshPollIntervalMs)
+        : main_camera_frame_buffer_copy(buffer.data(), frameSize, &outSize, &frameId);
+    if (!copied) {
         errorMsg = "Failed to copy frame from main camera buffer";
         return false;
     }
@@ -229,8 +241,15 @@ bool XYoffsetService::detectLaserSpotAvg(const cv::Mat& mapX,
         }
 
         if (i == 0) {
+            const double expectedPx = target_x_ / mm_per_pixel_;
+            const double expectedPy = target_y_ / mm_per_pixel_;
             cv::imwrite("/tmp/blobdetect.jpg", overhead);
             std::cout << "[XYoffset] blobdetect.jpg saved" << std::endl;
+            std::cout << "[XYoffset] measurement_context target_x=" << target_x_
+                      << " target_y=" << target_y_
+                      << " mm_per_pixel=" << mm_per_pixel_
+                      << " expectedPx=" << expectedPx
+                      << " expectedPy=" << expectedPy << std::endl;
         }
 
         double px = 0.0;
@@ -322,11 +341,17 @@ bool XYoffsetService::calibrate(double& outDxPx, double& outDyPx, std::string& e
     std::cout << "[XYoffset] Step 4: Build overhead maps (offset=0)" << std::endl;
     cameraInit();
     cameraSetOverheadXYOffset(0.0, 0.0);
+    std::cout << "[XYoffset] using_zero_offset_overhead_for_measurement" << std::endl;
     cv::Mat mapX;
     cv::Mat mapY;
     getOverHeadMaps(mapX, mapY);
     if (mapX.empty() || mapY.empty()) {
         std::cout << "[XYoffset] Warning: overhead maps unavailable, using raw image" << std::endl;
+    } else {
+        std::cout << "[XYoffset] map_ready width=" << mapX.cols
+                  << " height=" << mapX.rows
+                  << " mapX_type=" << mapX.type()
+                  << " mapY_type=" << mapY.type() << std::endl;
     }
 
     std::cout << "[XYoffset] Step 5: Detect laser spot (" << kDetectFrames << " frames)" << std::endl;

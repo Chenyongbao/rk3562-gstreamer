@@ -17,6 +17,7 @@ namespace {
 
 const cv::Vec3d kDefaultLaserSpotBoard(1.845, -4.7, 0.0);
 
+// 用 Kabsch/SVD 思路从 gantry 与 board 两套点云对应关系中拟合刚体变换。
 bool solveRigidGantryToBoard(const std::vector<SampleRecord>& records,
                              cv::Matx33d& rbg,
                              cv::Vec3d& tCombined) {
@@ -60,6 +61,7 @@ bool solveRigidGantryToBoard(const std::vector<SampleRecord>& records,
     return true;
 }
 
+// 将多帧旋转矩阵重新投影回合法旋转群 SO(3)。
 cv::Matx33d averageRotation(const std::vector<cv::Matx33d>& rotations) {
     // 对多帧旋转做 SVD 投影平均，避免逐元素平均破坏正交性。
     cv::Matx33d sumR = cv::Matx33d::zeros();
@@ -161,6 +163,7 @@ bool buildViceExtrinsicsReport(const std::vector<SampleRecord>& sample_records,
     camOffsetBoardMean *= (1.0 / static_cast<double>(camOffsetBoardList.size()));
     const cv::Vec3d camOffsetGantry = rbg.t() * camOffsetBoardMean;
 
+    // 报告里统一输出 board->gantry 和 camera->gantry 两套最终可消费的外参。
     const cv::Matx33d rcgMean = averageRotation(rcgList);
     const cv::Matx33d rgb = rbg.t();
     const cv::Matx33d rgc = rcgMean.t();

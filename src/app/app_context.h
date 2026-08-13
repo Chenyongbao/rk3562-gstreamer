@@ -4,18 +4,23 @@
 #include <stdint.h>
 #include <time.h>
 #include <signal.h>
-#include <pthread.h>
+#include <thread>
 #include <memory>
 #include <atomic>
 #include <cstring>
 #include <limits>
 #include <cstdio>
 
-#include "video/v4l2_capture.h"
+#include "pipeline/1_source/v4l2_capture.h"
+#include "pipeline/2_dispatcher/video_router.h"
+#include "pipeline/3_consumers/original/original_rtsp_consumer.h"
+#include "pipeline/3_consumers/bev/bev_rtsp_consumer.h"
+#include "pipeline/3_consumers/latest/latest_frame_consumer.h"
 #include "core/frame_queue.h"
-#include "rtsp/dual_rtsp_server.h"
+#include "pipeline/5_sink/rtsp/dual_rtsp_server.h"
 #include "yolodetect/yolo_wrapper.h"
 #include "protocol/UnifiedSocketServer.h"
+#include "app/capture_state.h"
 
 // 全局应用上下文前置声明，用于线程上下文中的回指。
 struct AppContext;
@@ -78,43 +83,24 @@ typedef struct {
     FrameQueue* input_queue;
     RTSPStreamer* stream;
     void* bev_processor;
-    V4L2Camera* v4l2_cam;
     volatile sig_atomic_t* running;
     const char* thread_name;
     struct AppContext* app;
 } WorkerContext;
-
-// 主采集循环状态：用于统计、日志节流及帧序号维护。
-typedef struct {
-    uint64_t frame_count;
-    uint64_t skip_no_client_count;
-    uint64_t main_camera_frame_id;
-    std::atomic<uint32_t> pending_bev_refresh_requests;
-    std::atomic<uint64_t> latest_bev_frame_id;
-    struct timespec last_stats_time;
-    bool last_has_any_client;
-    struct timespec last_no_client_log;
-} CaptureLoopState;
 
 // 应用运行期全局状态与资源句柄。
 typedef struct AppContext {
     V4L2Camera cam;
     FrameQueue original_queue;
     FrameQueue bev_queue;
+    VideoRouter video_router;                                   //分发路由
+    //==================== 消费者 ====================
+    std::unique_ptr<OriginalRtspConsumer> original_consumer;
+    std::unique_ptr<BevRtspConsumer> bev_consumer;
+    std::unique_ptr<MainCameraLatestFrameConsumer> main_camera_latest_frame_consumer;
+    
+    BevLatestFrameUpdater bev_latest_frame_updater;
     DualRTSPServer server;
-    YOLOHandle yolo_handle;
-    std::unique_ptr<UnifiedSocketServer> unified_server;
-
-    WorkerContext original_ctx;
-    WorkerContext bev_ctx;
-    pthread_t original_thread;
-    pthread_t bev_thread;
-
-    bool original_thread_started;
-    bool bev_thread_started;
-    bool curl_initialized;
-    bool rga_initialized;
-    bool rtsp_initialized;
     bool bev_buffer_initialized;
     bool main_buffer_initialized;
     bool v4l2_opened;
@@ -122,6 +108,16 @@ typedef struct AppContext {
     bool bev_queue_initialized;
 
     CaptureLoopState capture_state;
+
+    WorkerContext  original_ctx;
+    WorkerContext  bev_ctx;
+    YOLOHandle     yolo_handle;
+    std::unique_ptr<UnifiedSocketServer> unified_server;
+    bool           original_thread_started;
+    bool           bev_thread_started;
+    bool           curl_initialized;
+    bool           rga_initialized;
+    bool           rtsp_initialized;
 
 #ifdef ENABLE_PERFORMANCE_MONITORING
     PerfStats perf_main_bev_queue_push;
@@ -131,83 +127,6 @@ typedef struct AppContext {
     PerfStats perf_bev_push;
 #endif
 } AppContext;
-
-// 重置采集循环状态。
-static inline void initCaptureLoopState(CaptureLoopState* state)
-{
-    if (!state) {
-        return;
-    }
-    state->frame_count = 0;
-    state->skip_no_client_count = 0;
-    state->main_camera_frame_id = 0;
-    state->pending_bev_refresh_requests.store(0);
-    state->latest_bev_frame_id.store(0);
-    state->last_has_any_client = false;
-    state->last_no_client_log.tv_sec = 0;
-    state->last_no_client_log.tv_nsec = 0;
-    // 初始化为当前时间，确保统计节奏正确。
-    clock_gettime(CLOCK_MONOTONIC, &state->last_stats_time);
-}
-
-static inline void requestBevRefresh(CaptureLoopState* state, uint32_t count = 1)
-{
-    if (!state || count == 0) {
-        return;
-    }
-    state->pending_bev_refresh_requests.fetch_add(count, std::memory_order_relaxed);
-}
-
-static inline bool hasPendingBevRefreshRequest(const CaptureLoopState* state)
-{
-    if (!state) {
-        return false;
-    }
-    return state->pending_bev_refresh_requests.load(std::memory_order_relaxed) > 0;
-}
-
-static inline bool consumeBevRefreshRequest(CaptureLoopState* state)
-{
-    if (!state) {
-        return false;
-    }
-
-    uint32_t pending = state->pending_bev_refresh_requests.load(std::memory_order_relaxed);
-    while (pending > 0) {
-        if (state->pending_bev_refresh_requests.compare_exchange_weak(
-                pending,
-                pending - 1,
-                std::memory_order_relaxed,
-                std::memory_order_relaxed)) {
-            return true;
-        }
-    }
-    return false;
-}
-
-static inline uint32_t getPendingBevRefreshRequestCount(const CaptureLoopState* state)
-{
-    if (!state) {
-        return 0;
-    }
-    return state->pending_bev_refresh_requests.load(std::memory_order_relaxed);
-}
-
-static inline void recordLatestBevFrameId(CaptureLoopState* state, uint64_t frame_id)
-{
-    if (!state) {
-        return;
-    }
-    state->latest_bev_frame_id.store(frame_id, std::memory_order_relaxed);
-}
-
-static inline uint64_t getLatestBevFrameId(const CaptureLoopState* state)
-{
-    if (!state) {
-        return 0;
-    }
-    return state->latest_bev_frame_id.load(std::memory_order_relaxed);
-}
 
 // 初始化 AppContext，确保资源标志和句柄处于可预测初始状态。
 static inline void initAppContext(AppContext* app)
@@ -225,6 +144,10 @@ static inline void initAppContext(AppContext* app)
     std::memset(&app->bev_ctx, 0, sizeof(app->bev_ctx));
 
     app->yolo_handle = nullptr;
+    app->original_consumer.reset();
+    app->bev_consumer.reset();
+    app->main_camera_latest_frame_consumer.reset();
+    app->bev_latest_frame_updater.bind(nullptr);
     app->unified_server.reset();
     app->original_thread_started = false;
     app->bev_thread_started = false;

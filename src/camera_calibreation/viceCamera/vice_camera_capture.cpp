@@ -18,6 +18,7 @@
 
 namespace {
 
+// 用系统 v4l2-ctl 抓图，避免在标定模块里直接维护视频采集链路。
 class V4L2CtlImageCapturer final : public IImageCapturer {
 public:
     bool capture(const std::string& camera_device,
@@ -92,6 +93,7 @@ bool ViceCameraService::measureHeightAtCurrentPose(double& out_height, std::stri
 bool ViceCameraService::captureLoop(std::string& error_msg) {
     const int num_fixed = static_cast<int>(fixed_coordinates_.size());
 
+    // 每个固定采样点都串行执行：移动、测高、抓图、角点检测。
     for (int i = 0; i < num_fixed; ++i) {
         const double x = fixed_coordinates_[i].first;
         const double y = fixed_coordinates_[i].second;
@@ -126,6 +128,7 @@ bool ViceCameraService::captureLoop(std::string& error_msg) {
             return false;
         }
 
+        // 高度失败不会中断整轮采样，但该帧后续不能进入刚体求解。
         std::string height_error;
         double measured_height = 0.0;
         if (measureHeightAtCurrentPose(measured_height, height_error)) {
@@ -176,6 +179,7 @@ bool ViceCameraService::captureLoop(std::string& error_msg) {
                 image_points.size() >= static_cast<size_t>(kMinSolvePnpPointCount) &&
                 object_points.size() >= static_cast<size_t>(kMinSolvePnpPointCount) &&
                 image_points.size() == object_points.size()) {
+                // 对有效角点做鞍点细化，再送入统一的内参标定缓存。
                 ReallinkSaddlePointFit(image, image_points, kSaddleFitRadius);
                 txn.charuco_ok = true;
                 txn.image_points = image_points;

@@ -46,6 +46,8 @@ bool platformInit(GLContext& ctx, int output_width, int output_height,
     ctx.egl_image_input_y = EGL_NO_IMAGE_KHR;
     ctx.egl_image_input_uv = EGL_NO_IMAGE_KHR;
     ctx.uv_uses_rg88_format = false;
+    ctx.input_uv_prefers_rg88 = false;
+    ctx.input_uses_external_dmabuf = false;
 
     memset(&ctx.dma_output_y, 0, sizeof(ctx.dma_output_y));
     ctx.dma_output_y.fd = -1;

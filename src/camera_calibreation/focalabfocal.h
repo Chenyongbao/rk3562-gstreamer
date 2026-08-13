@@ -4,6 +4,8 @@
 #include <string>
 #include <vector>
 
+struct CaptureLoopState;
+
 enum class FocalMachineType {
     Unknown = 0,
     NewProjector,
@@ -66,8 +68,9 @@ struct FocalAutoFocusResult {
 // Autofocus service.
 class Focalabfocal {
 public:
-    Focalabfocal();
-    explicit Focalabfocal(const FocalAutoFocusConfig& config);
+    explicit Focalabfocal(CaptureLoopState* capture_state = nullptr);
+    Focalabfocal(const FocalAutoFocusConfig& config,
+                 CaptureLoopState* capture_state = nullptr);
     ~Focalabfocal() = default;
 
     bool runAutoFocus(FocalAutoFocusResult& result);
@@ -86,6 +89,7 @@ public:
 
 private:
     FocalAutoFocusConfig config_;
+    CaptureLoopState* capture_state_ = nullptr;
 };
 
 #endif // FOCALABFOCAL_H

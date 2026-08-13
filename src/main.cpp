@@ -5,7 +5,7 @@
 #include <unistd.h>
 
 #include "config.h"
-#include "app_runtime.h"
+#include "app/app_runtime.h"
 
 static volatile sig_atomic_t g_running = 1;
 

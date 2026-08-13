@@ -1,13 +1,15 @@
 #include "DetectCommandHandler.h"
 
 #include "../calib/camToolKit/calibData.h"
-#include "../camera_calibreation/klipper/klipper_manager.h"
+#include "../klipper/klipper_manager.h"
+#include "../camera_calibreation/totalHigh.h"
 #include "../config.h"
 #include "../reallink_ogles/file_utils.h"
 #include "../tools/WRbin.h"
+#include "../tools/json_utils.h"
 #include "../app/app_context.h"
-#include "../rtsp/rtsp_streamer.h"
-#include "../video/LatestNv12FrameBuffer.h"
+#include "../pipeline/5_sink/rtsp/rtsp_streamer.h"
+#include "../pipeline/3_consumers/common/LatestNv12FrameBuffer.h"
 
 #include <cerrno>
 #include <chrono>
@@ -26,32 +28,9 @@
 DetectCommandHandler::DetectCommandHandler(YOLOHandle handle)
     : yolo_handle_(handle) {}
 
-    //json检测校验
+    //json检测校验 — 委托给共享工具
 std::string DetectCommandHandler::escapeJsonString(const std::string& input) {
-    std::ostringstream oss;
-    for (char c : input) {
-        switch (c) {
-        case '"':
-            oss << "\\\"";
-            break;
-        case '\\':
-            oss << "\\\\";
-            break;
-        case '\n':
-            oss << "\\n";
-            break;
-        case '\r':
-            oss << "\\r";
-            break;
-        case '\t':
-            oss << "\\t";
-            break;
-        default:
-            oss << c;
-            break;
-        }
-    }
-    return oss.str();
+    return JsonUtils::escape(input);
 }
 //获取yolo的检测点击
 bool DetectCommandHandler::updateYoloJson(int width,
@@ -322,6 +301,8 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
     // 从共享配置文件中读取焦距和总高，避免不同来源的数据不一致。
     auto loadSharedMetrics = [&]() {
         const std::string conf_path = std::string(REALLINK_CV_CONF_PATH);
+        const std::string bin_path =
+            std::string(CALIB_RESULT_DIR) + "/" + std::string(CALIB_BIN_NAME);
         ReallinkCVConfig config;
         if (!readReallinkCVConf(conf_path, config)) {
             fprintf(stderr, "[Unified Server] WARNING: Failed to read %s\n", conf_path.c_str());
@@ -329,8 +310,15 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
             payload.focal_long = config.focal_long;
             payload.focal_short = config.focal_short;
             payload.focal_ok = true;
-            payload.total_high = config.totalHigh;
+        }
+
+        std::string total_high_error;
+        if (readPersistedTotalHigh(conf_path, bin_path, payload.total_high, &total_high_error)) {
             payload.total_high_ok = true;
+        } else {
+            payload.total_high_ok = false;
+            fprintf(stderr, "[Unified Server] WARNING: Failed to resolve totalHigh: %s\n",
+                    total_high_error.c_str());
         }
     };
 
@@ -339,6 +327,7 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
     constexpr int kFirstFrameTimeoutMs = 1500;
     constexpr int kFirstFramePollIntervalMs = 20;
 
+    KlipperManager::instance().deep(); // 蜂鸣器响一声，提示开始检测
     //开始第一帧的采集
     if (!bev_frame_buffer_has_frame()) {
         if (ctx.app) {

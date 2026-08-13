@@ -51,6 +51,39 @@ static std::string getReallinkConfPath()
     return std::string("/home/linaro/reallinkCV.conf");
 }
 
+static bool readFisheyeDistCoeffs(const Mat& cameraDist, Vec4d& outDist)
+{
+    if (cameraDist.empty() || cameraDist.total() < 4) {
+        return false;
+    }
+
+    Mat flattenedDist = cameraDist.reshape(1, 1);
+    Mat flattenedDist64;
+    flattenedDist.convertTo(flattenedDist64, CV_64F);
+    const double* coeffs = flattenedDist64.ptr<double>(0);
+    outDist = Vec4d(coeffs[0], coeffs[1], coeffs[2], coeffs[3]);
+    return true;
+}
+
+static std::string formatIntrinsicsSummary(const Matx33d& cameraK, const Mat& cameraDist)
+{
+    std::ostringstream oss;
+    oss << "fx=" << cameraK(0, 0)
+        << " fy=" << cameraK(1, 1)
+        << " cx=" << cameraK(0, 2)
+        << " cy=" << cameraK(1, 2);
+    Vec4d distCoeffs;
+    if (readFisheyeDistCoeffs(cameraDist, distCoeffs)) {
+        oss << " k1=" << distCoeffs[0]
+            << " k2=" << distCoeffs[1]
+            << " k3=" << distCoeffs[2]
+            << " k4=" << distCoeffs[3];
+    } else {
+        oss << " k1=? k2=? k3=? k4=?";
+    }
+    return oss.str();
+}
+
 // 高度补偿开关与参数
 static constexpr bool kEnableThicknessComp = true;
 static constexpr double kMmPerWorld = 320.0 / 1280.0;
@@ -209,6 +242,8 @@ static bool createPitchMapDirectPose()
                   << " tvec(used)=" << tvecForMap
                   << " thicknesshigh(dHmm)=" << dHmm
                   << " planeZ=" << planeZ << std::endl;
+        std::cout << "[camera] BEV_runtime_intrinsics "
+                  << formatIntrinsicsSummary(g_state.camera_k, g_state.camera_dist) << std::endl;
         return true;
     }
 
@@ -237,6 +272,8 @@ static bool createPitchMapDirectPose()
               << " tvec(used)=" << tvecForMap
               << " thicknesshigh(dHmm)=" << dHmm
               << " planeZ=" << planeZ << std::endl;
+    std::cout << "[camera] BEV_runtime_intrinsics "
+              << formatIntrinsicsSummary(g_state.camera_k, g_state.camera_dist) << std::endl;
     return true;
 }
 
@@ -278,6 +315,8 @@ void cameraInit()
             std::cout << "[camera] Intrinsics loaded from EEPROM" << std::endl;
             std::cout << "[camera]   fx=" << calibData.fx << " fy=" << calibData.fy
                       << " cx=" << calibData.cx << " cy=" << calibData.cy << std::endl;
+            std::cout << "[camera] EEPROM_full_intrinsics "
+                      << formatIntrinsicsSummary(g_state.camera_k, g_state.camera_dist) << std::endl;
         } else {
             std::cout << "[camera] EEPROM read failed, fallback to .bin file" << std::endl;
         }
@@ -297,6 +336,10 @@ void cameraInit()
             std::cout << "[camera] Extrinsics loaded from " << conf_path << std::endl;
             std::cout << "[camera]   BEV: rvec=" << g_state.bev_rvec << " tvec=" << g_state.bev_tvec << std::endl;
             std::cout << "[camera]   XY offset: dxPx=" << g_state.dx_px << " dyPx=" << g_state.dy_px << std::endl;
+            std::cout << "[camera] measurement_context rvec=" << g_state.bev_rvec
+                      << " tvec=" << g_state.bev_tvec
+                      << " dxPx=" << g_state.dx_px
+                      << " dyPx=" << g_state.dy_px << std::endl;
         } else {
             std::cout << "[camera] INFO: " << conf_path << " not found" << std::endl;
         }
@@ -396,6 +439,10 @@ void cameraReloadConfAndRebuildMaps()
         std::cout << "[camera] Reloaded extrinsic + XY offset from " << conf_path << std::endl;
         std::cout << "[camera]   BEV: rvec=" << g_state.bev_rvec << " tvec=" << g_state.bev_tvec << std::endl;
         std::cout << "[camera]   XY offset: dxPx=" << g_state.dx_px << " dyPx=" << g_state.dy_px << std::endl;
+        std::cout << "[camera] measurement_context rvec=" << g_state.bev_rvec
+                  << " tvec=" << g_state.bev_tvec
+                  << " dxPx=" << g_state.dx_px
+                  << " dyPx=" << g_state.dy_px << std::endl;
     } else {
         std::cout << "[camera] WARNING: Failed to reload " << conf_path << ", keep current params" << std::endl;
     }

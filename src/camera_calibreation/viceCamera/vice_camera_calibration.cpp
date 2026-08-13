@@ -9,6 +9,7 @@
 
 namespace {
 
+// OpenCV 内参标定实现：累积每帧 ChArUco 对应点后统一求解。
 class OpenCvCalibrationEngine final : public ICalibrationEngine {
 public:
     void reset() override {
@@ -66,6 +67,7 @@ public:
         std::vector<cv::Mat> rvecs;
         std::vector<cv::Mat> tvecs;
 
+        // OpenCV 输出的每帧 rvec/tvec 都表示 board->camera 的位姿。
         out_summary.rms = cv::calibrateCamera(all_object_points_,
                                               all_image_points_,
                                               image_size_,
@@ -179,6 +181,7 @@ bool ViceCameraService::finalizeCalibration(std::string& error_msg) {
         return false;
     }
 
+    // 只为成功完成 ChArUco 检测的样本保留位姿，数量必须与 OpenCV 输出一致。
     const size_t expected_pose_count = static_cast<size_t>(std::count_if(
         sample_txns_.begin(), sample_txns_.end(),
         [](const SampleTxn& txn) { return txn.charuco_ok; }));

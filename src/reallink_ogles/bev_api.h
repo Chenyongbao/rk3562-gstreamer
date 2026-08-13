@@ -20,6 +20,13 @@ bool bev_process_frame(BevHandle handle,
                        const uint8_t* nv12_input, size_t input_size,
                        uint8_t* nv12_output, size_t output_size);
 
+bool bev_process_frame_dmabuf(BevHandle handle,
+                              int nv12_input_fd,
+                              int input_stride,
+                              size_t input_size,
+                              uint8_t* nv12_output,
+                              size_t output_size);
+
 
 bool bev_bind_context_to_thread(BevHandle handle);
 

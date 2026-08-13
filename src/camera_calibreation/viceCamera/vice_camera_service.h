@@ -121,6 +121,7 @@ public:
 
 class ViceCameraService {
 public:
+    // 允许注入采集、标定和会话目录实现，便于替换真实硬件依赖做测试。
     explicit ViceCameraService(ViceCameraConfig config,
                                std::unique_ptr<IImageCapturer> image_capturer = nullptr,
                                std::unique_ptr<ICalibrationEngine> calibration_engine = nullptr,
@@ -132,6 +133,7 @@ public:
     const std::string& getLatestCaptureDir() const { return latest_capture_dir_; }
 
 private:
+    // 以下步骤串起完整流程：建目录、回零、采样、内参整理、外参求解和清理。
     bool createSessionDir(std::string& error_msg);
     bool forceHome(std::string& error_msg);
     bool sendScript(const std::string& script, std::string& error_msg);

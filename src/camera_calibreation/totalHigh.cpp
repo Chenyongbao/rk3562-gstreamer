@@ -8,15 +8,116 @@
 #include <cstring>
 #include <thread>
 #include <chrono>
+#include <cerrno>
+#include <cmath>
 
 #include "../config.h"
 #include "../calib/camToolKit/calibData.h"
-#include "klipper/klipper_manager.h"
-#define RdcnRatio 1
+#include "../klipper/klipper_manager.h"
+static constexpr double kRdcnRatio = 1.0;
 
 static constexpr double kTotalHighMeasureZ = 25.0;
 static constexpr int kTotalHighQueryRetries = 3;
 static constexpr int kTotalHighTriggerSettleMs = 150;
+
+namespace {
+
+bool isPositiveFinite(double value) {
+    return std::isfinite(value) && value > 0.0;
+}
+
+bool readTotalHighFromBin(const std::string& bin_path,
+                          double& out_height,
+                          std::string* error_msg) {
+    std::vector<uint8_t> blob;
+    if (!WRbin::instance().readAll(bin_path, blob)) {
+        if (error_msg) {
+            *error_msg = "Failed to read totalHigh bin: " + bin_path;
+        }
+        return false;
+    }
+    if (blob.size() < sizeof(CalibData)) {
+        if (error_msg) {
+            *error_msg = "totalHigh bin too small: " + bin_path;
+        }
+        return false;
+    }
+
+    CalibData calib {};
+    std::memcpy(&calib, blob.data(), sizeof(CalibData));
+    out_height = calib.distCoeffs[4];
+    if (!isPositiveFinite(out_height)) {
+        if (error_msg) {
+            *error_msg = "Invalid totalHigh in bin";
+        }
+        return false;
+    }
+    return true;
+}
+
+bool readTotalHighFromConf(const std::string& conf_path,
+                           double& out_height,
+                           std::string* error_msg) {
+    ReallinkCVConfig cv_config;
+    if (!readReallinkCVConf(conf_path, cv_config)) {
+        if (error_msg) {
+            *error_msg = "Failed to read totalHigh conf: " + conf_path;
+        }
+        return false;
+    }
+
+    out_height = cv_config.totalHigh;
+    if (!isPositiveFinite(out_height)) {
+        if (error_msg) {
+            *error_msg = "Invalid totalHigh in reallinkCV.conf";
+        }
+        return false;
+    }
+    return true;
+}
+
+} // namespace
+
+bool readPersistedTotalHigh(const std::string& confPath,
+                            const std::string& binPath,
+                            double& outHeight,
+                            std::string* errorMsg) {
+    double conf_height = 0.0;
+    double bin_height = 0.0;
+    std::string conf_error;
+    std::string bin_error;
+    const bool has_conf = readTotalHighFromConf(confPath, conf_height, &conf_error);
+    const bool has_bin = readTotalHighFromBin(binPath, bin_height, &bin_error);
+
+    if (has_bin) {
+        outHeight = bin_height;
+        if (errorMsg) {
+            errorMsg->clear();
+        }
+        return true;
+    }
+
+    if (has_conf) {
+        outHeight = conf_height;
+        if (errorMsg) {
+            errorMsg->clear();
+        }
+        return true;
+    }
+
+    if (errorMsg) {
+        if (!conf_error.empty() && !bin_error.empty()) {
+            *errorMsg = conf_error + " | " + bin_error;
+        } else if (!conf_error.empty()) {
+            *errorMsg = conf_error;
+        } else if (!bin_error.empty()) {
+            *errorMsg = bin_error;
+        } else {
+            *errorMsg = "Failed to read totalHigh from both bin and conf";
+        }
+    }
+    return false;
+}
 
 TotalHighService::TotalHighService(double feedrate, const char* confPath)
     : feedrate_(feedrate > 0 ? feedrate : CALIB_FEEDRATE),
@@ -62,12 +163,14 @@ bool TotalHighService::measure(double& outHeight, std::string& errorMsg) {
         }
 
         const double currentZ = kTotalHighMeasureZ;
-        outHeight = currentZ * RdcnRatio + distance;
+        outHeight = currentZ * kRdcnRatio + distance;
         std::cout << "[TotalHigh] Measurement successful! "
-                  << "Z=" << currentZ << "mm * RdcnRatio=" << RdcnRatio
+                  << "Z=" << currentZ << "mm * kRdcnRatio=" << kRdcnRatio
                   << " + distance=" << distance << "mm"
                   << " => totalHigh=" << outHeight << "mm" << std::endl;
-        saveTotalHigh(outHeight);
+        if (!saveTotalHigh(outHeight, errorMsg)) {
+            return false;
+        }
 
         const std::string bin_path = std::string(CALIB_RESULT_DIR) + "/" + std::string(CALIB_BIN_NAME);
         std::vector<uint8_t> blob;
@@ -113,38 +216,30 @@ void TotalHighService::sendGcodeScript(const std::string& script) {
     }
 }
 
-void TotalHighService::saveTotalHigh(double height) {
+bool TotalHighService::saveTotalHigh(double height, std::string& errorMsg) {
     ReallinkCVConfig cvConfig;
-    readReallinkCVConf(conf_path_, cvConfig);
+    if (!readReallinkCVConf(conf_path_, cvConfig)) {
+        std::cout << "[TotalHigh] Config not readable before save, will create fresh file: "
+                  << conf_path_ << std::endl;
+    }
     cvConfig.totalHigh = height;
     if (writeReallinkCVConf(conf_path_, cvConfig)) {
         std::cout << "[TotalHigh] Saved totalHigh=" << height << "mm to " << conf_path_ << std::endl;
+        errorMsg.clear();
+        return true;
     } else {
         std::cerr << "[TotalHigh] Failed to save totalHigh to " << conf_path_ << std::endl;
+        errorMsg = "Failed to save totalHigh to config: " + conf_path_;
+        return false;
     }
 }
 
 bool TotalHighService::readTotalHigh(double& outHeight, std::string& errorMsg) const {
     const std::string bin_path = std::string(CALIB_RESULT_DIR) + "/" + std::string(CALIB_BIN_NAME);
-    if (WRbin::instance().read(bin_path, &outHeight, sizeof(outHeight))) {
-        errorMsg.clear();
-        return true;
-    }
-
-    ReallinkCVConfig cvConfig;
-    if (!readReallinkCVConf(conf_path_, cvConfig)) {
-        errorMsg = "Failed to read totalHigh from both bin and reallinkCV.conf";
+    if (!readPersistedTotalHigh(conf_path_, bin_path, outHeight, &errorMsg)) {
         return false;
     }
-
-    outHeight = cvConfig.totalHigh;
-    if (outHeight <= 0.0) {
-        errorMsg = "Invalid totalHigh in reallinkCV.conf";
-        return false;
-    }
-
-    std::cout << "[TotalHigh] Fallback read totalHigh=" << outHeight
-              << "mm from " << conf_path_ << std::endl;
-    errorMsg.clear();
+    std::cout << "[TotalHigh] Read totalHigh=" << outHeight
+              << "mm using persisted source resolution" << std::endl;
     return true;
 }

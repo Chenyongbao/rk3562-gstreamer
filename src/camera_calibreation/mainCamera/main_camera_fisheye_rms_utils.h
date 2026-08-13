@@ -9,6 +9,7 @@
 #include <opencv2/calib3d.hpp>
 #include <opencv2/core.hpp>
 
+// 使用鱼眼模型把三维点重投影回图像，计算当前内外参组合的 RMS 误差。
 inline double computeFisheyeReprojectionRms(const std::vector<cv::Point3f>& objectPoints,
                                             const std::vector<cv::Point2f>& imagePoints,
                                             const cv::Mat& cameraMatrix,
@@ -39,6 +40,7 @@ inline double computeFisheyeReprojectionRms(const std::vector<cv::Point3f>& obje
     }
 }
 
+// 先做鱼眼去畸变，再在单位内参平面上求解外参。
 inline bool solveFisheyePose(const std::vector<cv::Point3f>& objectPoints,
                              const std::vector<cv::Point2f>& imagePoints,
                              const cv::Mat& cameraMatrix,
@@ -91,6 +93,7 @@ inline bool solveFisheyePose(const std::vector<cv::Point3f>& objectPoints,
     }
 }
 
+// 将外参求解与 RMS 评估打包，便于调用方一次拿到完整诊断结果。
 inline bool solveFisheyePoseAndComputeRms(const std::vector<cv::Point3f>& objectPoints,
                                           const std::vector<cv::Point2f>& imagePoints,
                                           const cv::Mat& cameraMatrix,

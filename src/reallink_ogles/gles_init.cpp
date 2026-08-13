@@ -29,6 +29,8 @@ bool initGLContext(GLContext& ctx, int width, int height) {
     ctx.egl_image_input_y = EGL_NO_IMAGE_KHR;
     ctx.egl_image_input_uv = EGL_NO_IMAGE_KHR;
     ctx.uv_uses_rg88_format = false;
+    ctx.input_uv_prefers_rg88 = false;
+    ctx.input_uses_external_dmabuf = false;
     memset(&ctx.dma_output, 0, sizeof(ctx.dma_output));
     ctx.dma_output.fd = -1;
 

@@ -1,15 +1,16 @@
-
 #include "bev_api.h"
 #include "gles_context.h"
 #include "camera.h"
+
 #include <EGL/egl.h>
-#include <iostream>
-#include <cstring>
 #include <chrono>
-#include <vector>
+#include <cstdio>
+#include <cstring>
+#include <iostream>
 #include <opencv2/opencv.hpp>
 #include <sys/ioctl.h>
 #include <linux/dma-buf.h>
+#include <vector>
 
 using namespace std;
 using namespace cv;
@@ -27,11 +28,243 @@ struct BevProcessor {
     int process_count;
 };
 
-BevHandle bev_init(int input_width, int input_height, 
-                   int output_width, int output_height) {
-    // cout << "[BEV] Initializing: input=" << input_width << "x" << input_height
-    //      << ", output=" << output_width << "x" << output_height << endl;
-    
+namespace {
+
+bool refreshOverheadMaps(BevProcessor* processor)
+{
+    if (!processor) {
+        return false;
+    }
+
+    const uint64_t current_ver = getOverHeadMapVersion();
+    if (current_ver == processor->map_version) {
+        return true;
+    }
+
+    cv::Mat mapX, mapY;
+    getOverHeadMaps(mapX, mapY);
+    if (!loadMapTextures(processor->gl_ctx, mapX, mapY)) {
+        cerr << "[BEV] ERROR: Failed to reload map textures!" << endl;
+        return false;
+    }
+
+    processor->map_version = current_ver;
+    cout << "[BEV] Map textures reloaded (version=" << processor->map_version << ")" << endl;
+    return true;
+}
+
+bool copyOutputIfRequested(BevProcessor* processor,
+                           uint8_t* nv12_output,
+                           size_t output_size)
+{
+    if (!processor) {
+        return false;
+    }
+
+    const size_t expected_output =
+        static_cast<size_t>(processor->output_width) *
+        static_cast<size_t>(processor->output_height) * 3 / 2;
+    if (!nv12_output) {
+        return true;
+    }
+    if (output_size < expected_output) {
+        return false;
+    }
+
+    Mat output_mat = readOutputBuffer(processor->gl_ctx,
+                                      processor->output_width,
+                                      processor->output_height);
+    if (output_mat.empty()) {
+        return false;
+    }
+
+    memcpy(nv12_output, output_mat.data, expected_output);
+    return true;
+}
+
+void recordProcessTime(BevProcessor* processor,
+                       const chrono::high_resolution_clock::time_point& start)
+{
+    if (!processor) {
+        return;
+    }
+
+    const auto end = chrono::high_resolution_clock::now();
+    const long process_time =
+        chrono::duration_cast<chrono::microseconds>(end - start).count();
+
+    processor->total_process_time_us += process_time;
+    processor->process_count++;
+
+    if (processor->process_count % 60 == 0) {
+        const long avg_time = processor->total_process_time_us / processor->process_count;
+        cout << "[BEV] Perf: avg=" << (avg_time / 1000.0) << " ms"
+             << ", upload=" << processor->gl_ctx.texture_upload_time << " ms"
+             << ", remap=" << processor->gl_ctx.remap_render_time << " ms"
+             << ", readback=" << processor->gl_ctx.buffer_export_time << " ms"
+             << endl;
+    }
+}
+
+bool processWithCpuInput(BevProcessor* processor,
+                         const uint8_t* nv12_input,
+                         size_t input_size,
+                         uint8_t* nv12_output,
+                         size_t output_size)
+{
+    if (!processor || !nv12_input) {
+        return false;
+    }
+
+    const size_t expected_input =
+        static_cast<size_t>(processor->input_width) *
+        static_cast<size_t>(processor->input_height) * 3 / 2;
+    if (input_size < expected_input) {
+        return false;
+    }
+
+    vector<uint8_t> empty_data;
+    const bool create_new_input_textures =
+        processor->first_frame ||
+        processor->gl_ctx.input_uses_external_dmabuf ||
+        processor->gl_ctx.input_texture_y == 0 ||
+        processor->gl_ctx.input_texture_uv == 0;
+
+    if (create_new_input_textures) {
+        if (!uploadNV12Textures(processor->gl_ctx,
+                                empty_data,
+                                processor->input_width,
+                                processor->input_height,
+                                true,
+                                nv12_input)) {
+            cerr << "[BEV] ERROR: First frame texture upload failed!" << endl;
+            return false;
+        }
+
+        const bool using_dma =
+            processor->gl_ctx.dma_input_y.fd >= 0 &&
+            processor->gl_ctx.dma_input_y.ptr != nullptr;
+        cout << "[BEV] Using " << (using_dma ? "DMA buffer" : "regular texture") << endl;
+        if (using_dma) {
+            const char* gl_ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+            if (gl_ver) {
+                cout << "  GL_VERSION: " << gl_ver << endl;
+            }
+            cout << "  Input DMA Y: fd=" << processor->gl_ctx.dma_input_y.fd
+                 << " egl=" << processor->gl_ctx.egl_image_input_y
+                 << " tex=" << processor->gl_ctx.input_texture_y << endl;
+            cout << "  Input DMA UV: fd=" << processor->gl_ctx.dma_input_uv.fd
+                 << " egl=" << processor->gl_ctx.egl_image_input_uv
+                 << " tex=" << processor->gl_ctx.input_texture_uv
+                 << " fmt=" << (processor->gl_ctx.uv_uses_rg88_format ? "RG88" : "GR88")
+                 << endl;
+        }
+    } else {
+        if (!writeNV12ToDmaBuffersPtr(processor->gl_ctx,
+                                      nv12_input,
+                                      processor->input_width,
+                                      processor->input_height)) {
+            cerr << "[BEV] ERROR: Failed to update input DMA buffers" << endl;
+            return false;
+        }
+
+        const uint8_t* data_ptr =
+            static_cast<const uint8_t*>(processor->gl_ctx.dma_input_y.ptr);
+        if (!uploadNV12Textures(processor->gl_ctx,
+                                empty_data,
+                                processor->input_width,
+                                processor->input_height,
+                                false,
+                                data_ptr)) {
+            cerr << "[BEV] ERROR: Failed to refresh input textures" << endl;
+            return false;
+        }
+    }
+
+    if (!performRemap(processor->gl_ctx,
+                      processor->input_width,
+                      processor->input_height,
+                      processor->output_width,
+                      processor->output_height)) {
+        return false;
+    }
+
+    if (!copyOutputIfRequested(processor, nv12_output, output_size)) {
+        return false;
+    }
+
+    processor->first_frame = false;
+    return true;
+}
+
+bool processWithExternalDmabuf(BevProcessor* processor,
+                               int nv12_input_fd,
+                               int input_stride,
+                               size_t input_size,
+                               uint8_t* nv12_output,
+                               size_t output_size)
+{
+    if (!processor || nv12_input_fd < 0) {
+        return false;
+    }
+    if (input_stride < processor->input_width) {
+        return false;
+    }
+
+    const size_t expected_input =
+        static_cast<size_t>(input_stride) *
+        static_cast<size_t>(processor->input_height) * 3 / 2;
+    if (input_size < expected_input) {
+        return false;
+    }
+
+    if (!uploadNV12DmabufTextures(processor->gl_ctx,
+                                  nv12_input_fd,
+                                  processor->input_width,
+                                  processor->input_height,
+                                  input_stride,
+                                  input_size)) {
+        cerr << "[BEV] ERROR: Failed to import external NV12 dmabuf" << endl;
+        return false;
+    }
+
+    if (processor->first_frame) {
+        const char* gl_ver = reinterpret_cast<const char*>(glGetString(GL_VERSION));
+        cout << "[BEV] Using external dmabuf input" << endl;
+        if (gl_ver) {
+            cout << "  GL_VERSION: " << gl_ver << endl;
+        }
+        cout << "  Input DMA Y: fd=" << nv12_input_fd
+             << " egl=" << processor->gl_ctx.egl_image_input_y
+             << " tex=" << processor->gl_ctx.input_texture_y << endl;
+        cout << "  Input DMA UV: fd=" << nv12_input_fd
+             << " egl=" << processor->gl_ctx.egl_image_input_uv
+             << " tex=" << processor->gl_ctx.input_texture_uv
+             << " fmt=" << (processor->gl_ctx.uv_uses_rg88_format ? "RG88" : "GR88")
+             << endl;
+    }
+
+    if (!performRemap(processor->gl_ctx,
+                      processor->input_width,
+                      processor->input_height,
+                      processor->output_width,
+                      processor->output_height)) {
+        return false;
+    }
+
+    if (!copyOutputIfRequested(processor, nv12_output, output_size)) {
+        return false;
+    }
+
+    processor->first_frame = false;
+    return true;
+}
+
+}  // namespace
+
+BevHandle bev_init(int input_width, int input_height,
+                   int output_width, int output_height)
+{
     try {
         BevProcessor* processor = new BevProcessor();
         processor->input_width = input_width;
@@ -42,21 +275,21 @@ BevHandle bev_init(int input_width, int input_height,
         processor->total_process_time_us = 0;
         processor->process_count = 0;
         processor->initialized = false;
-        
+
         cameraInit();
-        
+
         cv::Mat mapX, mapY;
         getOverHeadMaps(mapX, mapY);
         cout << "[BEV] Map size: " << mapX.cols << "x" << mapX.rows << endl;
         processor->map_version = getOverHeadMapVersion();
-        
+
         if (!initGLContext(processor->gl_ctx, output_width, output_height)) {
             cerr << "[BEV] ERROR: Failed to initialize OpenGL ES context!" << endl;
             delete processor;
             return nullptr;
         }
         cout << "[BEV] EGL initialized successfully" << endl;
-        
+
         if (!createShaderProgram(processor->gl_ctx)) {
             cerr << "[BEV] ERROR: Failed to create shader program!" << endl;
             cleanupGLContext(processor->gl_ctx);
@@ -64,7 +297,7 @@ BevHandle bev_init(int input_width, int input_height,
             return nullptr;
         }
         cout << "[BEV] Shader program created" << endl;
-        
+
         if (!loadMapTextures(processor->gl_ctx, mapX, mapY)) {
             cerr << "[BEV] ERROR: Failed to load map textures!" << endl;
             cleanupGLContext(processor->gl_ctx);
@@ -73,29 +306,30 @@ BevHandle bev_init(int input_width, int input_height,
         }
         cout << "[BEV] Map textures loaded" << endl;
 
-
         if (!initFramebuffers(processor->gl_ctx, output_width, output_height)) {
             cerr << "[BEV] ERROR: Failed to init framebuffers!" << endl;
             cleanupGLContext(processor->gl_ctx);
             delete processor;
             return nullptr;
         }
-        
+
         processor->initialized = true;
         cout << "[BEV] Initialization complete!" << endl;
 
+        eglMakeCurrent(processor->gl_ctx.display,
+                       EGL_NO_SURFACE,
+                       EGL_NO_SURFACE,
+                       EGL_NO_CONTEXT);
 
-        eglMakeCurrent(processor->gl_ctx.display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
-        
         return processor;
-        
     } catch (const exception& e) {
         cerr << "[BEV] Exception during initialization: " << e.what() << endl;
         return nullptr;
     }
 }
 
-bool bev_bind_context_to_thread(BevHandle handle) {
+bool bev_bind_context_to_thread(BevHandle handle)
+{
     if (!handle) return false;
     BevProcessor* processor = (BevProcessor*)handle;
     if (!processor->initialized) return false;
@@ -110,131 +344,91 @@ bool bev_bind_context_to_thread(BevHandle handle) {
 }
 
 bool bev_process_frame(BevHandle handle,
-                       const uint8_t* nv12_input, size_t input_size,
-                       uint8_t* nv12_output, size_t output_size) {
+                       const uint8_t* nv12_input,
+                       size_t input_size,
+                       uint8_t* nv12_output,
+                       size_t output_size)
+{
     if (!handle || !nv12_input) {
         return false;
     }
-    
+
     BevProcessor* processor = (BevProcessor*)handle;
     if (!processor->initialized) {
         return false;
     }
-    
-    auto start = chrono::high_resolution_clock::now();
-    
+
+    const auto start = chrono::high_resolution_clock::now();
+
     try {
-        // 如果标定导致 map 更新，则自动重载 map texture（只�?version 变化时触发）
-        uint64_t current_ver = getOverHeadMapVersion();
-        if (current_ver != processor->map_version) {
-            cv::Mat mapX, mapY;
-            getOverHeadMaps(mapX, mapY);
-            if (!loadMapTextures(processor->gl_ctx, mapX, mapY)) {
-                cerr << "[BEV] ERROR: Failed to reload map textures!" << endl;
-                return false;
-            }
-            processor->map_version = current_ver;
-            cout << "[BEV] Map textures reloaded (version=" << processor->map_version << ")" << endl;
-        }
-
-        size_t expected_input = processor->input_width * processor->input_height * 3 / 2;
-        size_t expected_output = processor->output_width * processor->output_height * 3 / 2;
-        
-        if (input_size < expected_input) {
+        if (!refreshOverheadMaps(processor)) {
             return false;
         }
-        
-        vector<uint8_t> empty_data;
-        
-        if (processor->first_frame) {
-            if (!uploadNV12Textures(processor->gl_ctx, empty_data, 
-                                   processor->input_width, processor->input_height, 
-                                   true, nv12_input)) {
-                cerr << "[BEV] ERROR: First frame texture upload failed!" << endl;
-                return false;
-            }
-            
-            bool using_dma = (processor->gl_ctx.dma_input_y.fd >= 0 && 
-                             processor->gl_ctx.dma_input_y.ptr != nullptr);
-            cout << "[BEV] Using " << (using_dma ? "DMA buffer" : "regular texture") << endl;
-            if (using_dma) {
-                const char* gl_ver = (const char*)glGetString(GL_VERSION);
-                if (gl_ver) {
-                    cout << "  GL_VERSION: " << gl_ver << endl;
-                }
-                cout << "  Input DMA Y: fd=" << processor->gl_ctx.dma_input_y.fd
-                     << " egl=" << processor->gl_ctx.egl_image_input_y
-                     << " tex=" << processor->gl_ctx.input_texture_y << endl;
-                cout << "  Input DMA UV: fd=" << processor->gl_ctx.dma_input_uv.fd
-                     << " egl=" << processor->gl_ctx.egl_image_input_uv
-                     << " tex=" << processor->gl_ctx.input_texture_uv
-                     << " fmt=" << (processor->gl_ctx.uv_uses_rg88_format ? "RG88" : "GR88")
-                     << endl;
-            }
-            
-            processor->first_frame = false;
-        } else {
-            writeNV12ToDmaBuffersPtr(processor->gl_ctx, nv12_input,
-                                    processor->input_width, processor->input_height);
-            
-            const uint8_t* data_ptr = static_cast<const uint8_t*>(processor->gl_ctx.dma_input_y.ptr);
-            uploadNV12Textures(processor->gl_ctx, empty_data,
-                              processor->input_width, processor->input_height,
-                              false, data_ptr);
-            
-
-        }
-        
-        if (!performRemap(processor->gl_ctx,
-                         processor->input_width, processor->input_height,
-                         processor->output_width, processor->output_height)) {
+        if (!processWithCpuInput(processor,
+                                 nv12_input,
+                                 input_size,
+                                 nv12_output,
+                                 output_size)) {
             return false;
         }
-        
 
-        if (nv12_output && output_size >= expected_output) {
-            Mat output_mat = readOutputBuffer(processor->gl_ctx,
-                                             processor->output_width,
-                                             processor->output_height);
-            if (output_mat.empty()) {
-                return false;
-            }
-            memcpy(nv12_output, output_mat.data, expected_output);
-        } else {
-
-        }
-        
-        auto end = chrono::high_resolution_clock::now();
-        long process_time = chrono::duration_cast<chrono::microseconds>(end - start).count();
-        
-        processor->total_process_time_us += process_time;
-        processor->process_count++;
-        
-        if (processor->process_count % 60 == 0) {
-            long avg_time = processor->total_process_time_us / processor->process_count;
-            cout << "[BEV] Perf: avg=" << (avg_time / 1000.0) << " ms"
-                 << ", upload=" << processor->gl_ctx.texture_upload_time << " ms"
-                 << ", remap=" << processor->gl_ctx.remap_render_time << " ms"
-                 << ", readback=" << processor->gl_ctx.buffer_export_time << " ms"
-                 << endl;
-        }
-        
+        recordProcessTime(processor, start);
         return true;
-        
     } catch (const exception& e) {
         cerr << "[BEV] Exception: " << e.what() << endl;
         return false;
     }
 }
 
-long bev_get_avg_process_time_us(BevHandle handle) {
+bool bev_process_frame_dmabuf(BevHandle handle,
+                              int nv12_input_fd,
+                              int input_stride,
+                              size_t input_size,
+                              uint8_t* nv12_output,
+                              size_t output_size)
+{
+    if (!handle || nv12_input_fd < 0) {
+        return false;
+    }
+
+    BevProcessor* processor = (BevProcessor*)handle;
+    if (!processor->initialized) {
+        return false;
+    }
+
+    const auto start = chrono::high_resolution_clock::now();
+
+    try {
+        if (!refreshOverheadMaps(processor)) {
+            return false;
+        }
+        if (!processWithExternalDmabuf(processor,
+                                       nv12_input_fd,
+                                       input_stride,
+                                       input_size,
+                                       nv12_output,
+                                       output_size)) {
+            return false;
+        }
+
+        recordProcessTime(processor, start);
+        return true;
+    } catch (const exception& e) {
+        cerr << "[BEV] Exception: " << e.what() << endl;
+        return false;
+    }
+}
+
+long bev_get_avg_process_time_us(BevHandle handle)
+{
     if (!handle) return -1;
     BevProcessor* processor = (BevProcessor*)handle;
     if (processor->process_count == 0) return 0;
     return processor->total_process_time_us / processor->process_count;
 }
 
-void bev_cleanup(BevHandle handle) {
+void bev_cleanup(BevHandle handle)
+{
     if (!handle) return;
     BevProcessor* processor = (BevProcessor*)handle;
     cout << "[BEV] Cleaning up..." << endl;
@@ -250,7 +444,8 @@ bool bev_get_output_dmabuf_info(BevHandle handle,
                                 int* width_y, int* height_y,
                                 int* fd_uv, int* stride_uv,
                                 int* width_uv, int* height_uv,
-                                int* uv_is_rg88) {
+                                int* uv_is_rg88)
+{
     if (!handle) return false;
     BevProcessor* p = (BevProcessor*)handle;
     if (fd_y) *fd_y = p->gl_ctx.dma_output_y.fd;
@@ -266,7 +461,8 @@ bool bev_get_output_dmabuf_info(BevHandle handle,
     return ok;
 }
 
-bool bev_acquire_output_dmabuf(BevHandle handle) {
+bool bev_acquire_output_dmabuf(BevHandle handle)
+{
     if (!handle) return false;
     BevProcessor* p = (BevProcessor*)handle;
     if (!(p->gl_ctx.dma_output_y.fd >= 0 && p->gl_ctx.dma_output_uv.fd >= 0)) return false;
@@ -279,7 +475,8 @@ bool bev_acquire_output_dmabuf(BevHandle handle) {
     return true;
 }
 
-void bev_release_output_dmabuf(BevHandle handle) {
+void bev_release_output_dmabuf(BevHandle handle)
+{
     if (!handle) return;
     BevProcessor* p = (BevProcessor*)handle;
     if (!(p->gl_ctx.dma_output_y.fd >= 0 && p->gl_ctx.dma_output_uv.fd >= 0)) return;
@@ -288,5 +485,3 @@ void bev_release_output_dmabuf(BevHandle handle) {
     ioctl(p->gl_ctx.dma_output_y.fd, DMA_BUF_IOCTL_SYNC, &sync);
     ioctl(p->gl_ctx.dma_output_uv.fd, DMA_BUF_IOCTL_SYNC, &sync);
 }
-
-

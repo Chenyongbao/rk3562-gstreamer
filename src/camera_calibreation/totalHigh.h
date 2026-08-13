@@ -4,6 +4,11 @@
 #include <string>
 #include "../config.h"
 
+bool readPersistedTotalHigh(const std::string& confPath,
+                            const std::string& binPath,
+                            double& outHeight,
+                            std::string* errorMsg = nullptr);
+
 class TotalHighService {
 public:
     explicit TotalHighService(double feedrate = CALIB_FEEDRATE,
@@ -15,7 +20,7 @@ public:
 
 private:
     void sendGcodeScript(const std::string& script);
-    void saveTotalHigh(double height);
+    bool saveTotalHigh(double height, std::string& errorMsg);
 
     double feedrate_;
     std::string conf_path_;

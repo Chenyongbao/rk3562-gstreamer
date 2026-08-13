@@ -45,6 +45,7 @@ ViceCameraService::ViceCameraService(ViceCameraConfig config,
                                      std::unique_ptr<ICalibrationEngine> calibration_engine,
                                      std::unique_ptr<ISessionStore> session_store)
     : config_(std::move(config)) {
+    // 默认走真实相机采集、OpenCV 标定和本地目录管理，也支持测试替身注入。
     image_capturer_ = image_capturer ? std::move(image_capturer)
                                      : makeV4L2CtlImageCapturer();
     calibration_engine_ = calibration_engine ? std::move(calibration_engine)
@@ -61,6 +62,7 @@ ViceCameraResult ViceCameraService::run(bool skip_homing) {
     bool has_captured_images = false;
 
     try {
+        // 标定入口按“准备环境 -> 采样 -> 求解 -> 恢复现场”的顺序执行。
         if (!createSessionDir(error_msg)) {
             result.error = error_msg;
             return result;
@@ -128,6 +130,7 @@ bool ViceCameraService::createSessionDir(std::string& error_msg) {
 }
 
 bool ViceCameraService::forceHome(std::string& error_msg) {
+    // 复用 Klipper 的回零能力，确保采样点都基于统一机械原点。
     return KlipperManager::instance().forceHome(&error_msg);
 }
 
@@ -136,6 +139,7 @@ bool ViceCameraService::sendScript(const std::string& script, std::string& error
 }
 
 bool ViceCameraService::triggerLaserRange(std::string& error_msg) {
+    // 激光测距通过独立 GCode 触发，结果由后续 query 接口轮询获取。
     return sendScript("LASER_RANGE_SENSOR SENSOR=my_range_sensor", error_msg);
 }
 
@@ -150,6 +154,7 @@ bool ViceCameraService::queryLaserDistance(double& out_distance, bool& out_valid
 }
 
 bool ViceCameraService::setFillLight(int brightness, std::string& error_msg) {
+    // 标定前压低补光亮度，结束后恢复默认亮度。
     return KlipperManager::instance().setFillLight(brightness, &error_msg);
 }
 
