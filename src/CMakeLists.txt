@@ -18,6 +18,17 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 # ---------------------------------------------------------------------------
+# spdlog — 统一日志（header-only，避免为交叉编译目标额外编译库）
+# ---------------------------------------------------------------------------
+include(FetchContent)
+FetchContent_Declare(
+    spdlog
+    GIT_REPOSITORY https://github.com/gabime/spdlog.git
+    GIT_TAG v1.14.1
+)
+FetchContent_MakeAvailable(spdlog)
+
+# ---------------------------------------------------------------------------
 # SDK paths — defaults match the Makefile, override with -D or env
 # ---------------------------------------------------------------------------
 set(RK3562_SDK_ROOT "/home/yuheng.song/rk3562"
@@ -76,20 +87,12 @@ set(CXX_SOURCES
     app/app_runtime.cpp
 
     core/dmabuf_utils.cpp
-    core/frame_queue.cpp
 
-    pipeline/1_source/v4l2_capture.cpp
-    pipeline/2_dispatcher/video_router.cpp
-    pipeline/2_dispatcher/capture_loop.cpp
-    pipeline/3_consumers/common/LatestNv12FrameBuffer.cpp
-    pipeline/3_consumers/common/consumer_buffer_pool.cpp
-    pipeline/3_consumers/bev/bev_rtsp_consumer.cpp
-    pipeline/3_consumers/latest/latest_frame_consumer.cpp
-    pipeline/3_consumers/original/original_rtsp_consumer.cpp
-    pipeline/4_workers/stream_workers.cpp
-    pipeline/5_sink/rtsp/rga_processor.cpp
-    pipeline/5_sink/rtsp/rtsp_streamer.cpp
-    pipeline/5_sink/rtsp/dual_rtsp_server.cpp
+    pipeline/1_source/gst_v4l2_source.cpp
+    pipeline/common/frame_provider.cpp
+    pipeline/2_workers/stream_workers.cpp
+    pipeline/3_sink/rtsp/rtsp_streamer.cpp
+    pipeline/3_sink/rtsp/dual_rtsp_server.cpp
 
     opencv_vendor/fisheye/fisheye.cpp
 
@@ -102,46 +105,45 @@ set(CXX_SOURCES
     reallink_ogles/gles_texture.cpp
     reallink_ogles/gles_dma_texture.cpp
     reallink_ogles/platform.cpp
-    reallink_ogles/video_stream.cpp
-
-    yolodetect/yolo_wrapper.cpp
-    yolodetect/thickness.cpp
+    detection/thickness.cpp
 
     yolo/embedded_model.cpp
     yolo/yolo_model.cpp
     yolo/yolo_preprocess.cpp
     yolo/yolo_postprocess.cpp
 
-    camera_calibreation/viceCamera/vice_camera_service.cpp
-    camera_calibreation/viceCamera/vice_camera_capture.cpp
-    camera_calibreation/viceCamera/vice_camera_calibration.cpp
-    camera_calibreation/viceCamera/vice_camera_utils.cpp
-    camera_calibreation/viceCamera/vice_camera_extrinsics.cpp
-    camera_calibreation/mainCamera/main_camera_fisheye_calib.cpp
-    camera_calibreation/mainCamera/main_camera_default_intrinsics_refinement.cpp
-    camera_calibreation/XYoffset.cpp
-    camera_calibreation/totalHigh.cpp
-    camera_calibreation/focalabfocal.cpp
-    camera_calibreation/focal_range_normalizer.cpp
+    camera_calibration/viceCamera/vice_camera_service.cpp
+    camera_calibration/viceCamera/vice_camera_capture.cpp
+    camera_calibration/viceCamera/vice_camera_calibration.cpp
+    camera_calibration/viceCamera/vice_camera_utils.cpp
+    camera_calibration/viceCamera/vice_camera_extrinsics.cpp
+    camera_calibration/mainCamera/main_camera_fisheye_calib.cpp
+    camera_calibration/mainCamera/main_camera_default_intrinsics_refinement.cpp
+    camera_calibration/XYoffset.cpp
+    camera_calibration/totalHigh.cpp
+    camera_calibration/focalabfocal.cpp
+    camera_calibration/focal_range_normalizer.cpp
 
     klipper/klipper_manager.cpp
 
     calib/charuco_detector.cpp
     calib/ChessboardDetector.cpp
     calib/calibinit.cpp
-    calib/aruco_calibration.cpp
     calib/saddleFit.cpp
     calib/camToolKit/calib_eeprom.cpp
     calib/cbdetect/findCorners.cpp
     calib/cbdetect/boards.cpp
     calib/cbdetect/growBoard.cpp
     calib/cbdetect/imgPatch.cpp
-    calib/cbdetect/plot_corners.cpp
-    calib/cbdetect/plot_boards.cpp
+    # 注：calib/aruco_calibration.cpp 是离线标定工具（自带 main），不能编进服务端（重复 main）。
+    #     calib/cbdetect/plot_corners.cpp / plot_boards.cpp 是可视化遗留，全工程无调用，不再编译。
 
     handlers/CalibCommandHandler.cpp
     handlers/DetectCommandHandler.cpp
+    handlers/klipper_flow.cpp
 
+    protocol/CommandHandler.cpp
+    protocol/CommandRouter.cpp
     protocol/UnifiedSocketServer.cpp
 )
 
@@ -243,6 +245,7 @@ endif()
 # Libraries
 # ---------------------------------------------------------------------------
 target_link_libraries(reallinkCVserver PRIVATE
+    spdlog::spdlog_header_only
     gstapp-1.0
     gstbase-1.0
     gstreamer-1.0

@@ -1,0 +1,19 @@
+{
+  "configurations": [
+    {
+      "name": "linux-gcc-x64",
+      "includePath": [
+        "${workspaceFolder}/**"
+      ],
+      "defines": [
+        "_POSIX_C_SOURCE=199309L",
+        "_GNU_SOURCE",
+        "ENABLE_PERFORMANCE_MONITORING"
+      ],
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "linux-gcc-x64"
+    }
+  ],
+  "version": 4
+}

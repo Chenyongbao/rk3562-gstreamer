@@ -92,8 +92,8 @@
  CFLAGS += -I$(SRC_DIR)/interfaces
  CFLAGS += -I$(SRC_DIR)/interfaces/command_server
  CFLAGS += -I$(SRC_DIR)/runtime
- CFLAGS += -I$(SRC_DIR)/yolodetect
- CFLAGS += -I$(SRC_DIR)/yolodetect/core
+ CFLAGS += -I$(SRC_DIR)/detection
+ CFLAGS += -I$(SRC_DIR)/detection/core
  # Keep curl after standard headers.
  CURL_INC = $(RK3562_SDK_ROOT)/buildroot/output/rockchip_rk3562_recovery/host/aarch64-buildroot-linux-gnu/sysroot/usr/include
  CFLAGS += -idirafter $(CURL_INC)
@@ -132,8 +132,8 @@
  CXXFLAGS += -I$(SRC_DIR)/interfaces
  CXXFLAGS += -I$(SRC_DIR)/interfaces/command_server
  CXXFLAGS += -I$(SRC_DIR)/runtime
- CXXFLAGS += -I$(SRC_DIR)/yolodetect
- CXXFLAGS += -I$(SRC_DIR)/yolodetect/core
+ CXXFLAGS += -I$(SRC_DIR)/detection
+ CXXFLAGS += -I$(SRC_DIR)/detection/core
  CXXFLAGS += -I$(RKNN_INC)
  CXXFLAGS += -I$(INCLUDE_DIR)/aarch64-linux-gnu
  CXXFLAGS += -I$(INCLUDE_DIR)
@@ -224,11 +224,10 @@
                    $(SRC_DIR)/runtime/reallink_cv_config.cpp \
                    $(SRC_DIR)/board_surface/board_surface_scan.cpp \
                    $(SRC_DIR)/board_surface/surface_quadric.cpp \
-                   $(SRC_DIR)/yolodetect/yolo_wrapper.cpp \
-                   $(SRC_DIR)/yolodetect/z_probe_common.cpp \
-                   $(SRC_DIR)/yolodetect/thickness.cpp \
-                   $(SRC_DIR)/yolodetect/core/YOLOSegmentor.cpp \
-                   $(SRC_DIR)/yolodetect/core/embedded_model.cpp \
+                   $(SRC_DIR)/detection/z_probe_common.cpp \
+                   $(SRC_DIR)/detection/thickness.cpp \
+                   $(SRC_DIR)/detection/core/YOLOSegmentor.cpp \
+                   $(SRC_DIR)/detection/core/embedded_model.cpp \
                    $(SRC_DIR)/camera_calibration/viceCamera/vice_camera_service.cpp \
                    $(SRC_DIR)/camera_calibration/viceCamera/vice_camera_capture.cpp \
                    $(SRC_DIR)/camera_calibration/viceCamera/vice_camera_calibration.cpp \

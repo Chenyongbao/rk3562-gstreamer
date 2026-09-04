@@ -1,15 +1,18 @@
 #include "DetectCommandHandler.h"
 
-#include "../calib/camToolKit/calibData.h"
-#include "../klipper/klipper_manager.h"
-#include "../camera_calibreation/totalHigh.h"
-#include "../config.h"
-#include "../reallink_ogles/file_utils.h"
-#include "../tools/WRbin.h"
-#include "../tools/json_utils.h"
-#include "../app/app_context.h"
-#include "../pipeline/5_sink/rtsp/rtsp_streamer.h"
-#include "../pipeline/3_consumers/common/LatestNv12FrameBuffer.h"
+#include "app/app_context.h"
+#include "calib/camToolKit/calibData.h"
+#include "camera_calibration/totalHigh.h"
+#include "config.h"
+#include "handlers/klipper_flow.h"
+#include "klipper/klipper_manager.h"
+#include "pipeline/3_sink/rtsp/rtsp_streamer.h"
+#include "pipeline/common/frame_provider.h"
+#include "reallink_ogles/file_utils.h"
+#include "tools/WRbin.h"
+#include "tools/json_utils.h"
+#include "yolo/yolo_model.h"
+#include "yolo/yolo_postprocess.h"
 
 #include <cerrno>
 #include <chrono>
@@ -20,34 +23,46 @@
 #include <iomanip>
 #include <opencv2/imgcodecs.hpp>
 #include <opencv2/imgproc.hpp>
+#include <spdlog/spdlog.h>
 #include <sstream>
 #include <sys/select.h>
-#include <thread>
 #include <unistd.h>
 
-DetectCommandHandler::DetectCommandHandler(YOLOHandle handle)
-    : yolo_handle_(handle) {}
+DetectCommandHandler::DetectCommandHandler(YOLOModel* model)
+    : yolo_model_(model) {}
 
-    //json检测校验 — 委托给共享工具
+// JSON 字符串转义（委托给共享工具）
 std::string DetectCommandHandler::escapeJsonString(const std::string& input) {
     return JsonUtils::escape(input);
 }
-//获取yolo的检测点击
-bool DetectCommandHandler::updateYoloJson(int width,
+// 从 YOLO 检测结果生成检测 JSON
+void DetectCommandHandler::updateYoloJson(int width,
                                           int height,
-                                          const YOLOFrameResult& frame_result,
+                                          const std::vector<SegmentationResult>& results,
                                           DetectResponsePayload& payload) const {
-    payload.count = frame_result.detection_count;
-
-    std::string yolo_json;
-    if (!yolo_get_results_json(yolo_handle_, width, height, yolo_json)) {
-        return false;
-    }
-
-    payload.yolo_json = yolo_json;
-    return true;
+    payload.count = static_cast<int>(results.size());
+    payload.yolo_json = buildObjectsJson(results, width, height);
 }
-//寻找json文本中的成员
+// 构建 YOLO 检测结果的 image+objects JSON（与旧 yolo_get_results_json 输出格式一致）
+std::string DetectCommandHandler::buildObjectsJson(
+    const std::vector<SegmentationResult>& results, int width, int height) {
+    std::ostringstream json_stream;
+    json_stream << std::fixed << std::setprecision(4);
+    json_stream << "{\n  \"image\": {\"width\": " << width << ", \"height\": " << height
+                << "},\n  \"objects\": [\n";
+    for (size_t i = 0; i < results.size(); i++) {
+        const SegmentationResult& r = results[i];
+        json_stream << "    {\"class_id\": " << r.classId
+                    << ", \"class_name\": \"" << r.className << "\""
+                    << ", \"confidence\": " << r.confidence
+                    << ", \"roi_xywh\": [" << r.boundingBox.x << ", " << r.boundingBox.y
+                    << ", " << r.boundingBox.width << ", " << r.boundingBox.height << "]}"
+                    << (i + 1 < results.size() ? "," : "") << "\n";
+    }
+    json_stream << "  ]\n}";
+    return json_stream.str();
+}
+// 提取 JSON 对象花括号内的内容
 std::string DetectCommandHandler::extractJsonObjectMembers(const std::string& json_object) {
     const size_t begin = json_object.find('{');
     const size_t end = json_object.rfind('}');
@@ -56,7 +71,7 @@ std::string DetectCommandHandler::extractJsonObjectMembers(const std::string& js
     }
     return json_object.substr(begin + 1, end - begin - 1);
 }
-//构建完整的发送的文本
+// 构建完整的 DETECT 响应 JSON
 std::string DetectCommandHandler::buildDetectJson(const DetectResponsePayload& payload) const {
     std::ostringstream json_stream;
     json_stream << std::fixed << std::setprecision(2);
@@ -71,8 +86,8 @@ std::string DetectCommandHandler::buildDetectJson(const DetectResponsePayload& p
         json_stream << "\"focal_long\":" << payload.focal_long << ","
                     << "\"focal_short\":" << payload.focal_short << ",";
     } else {
-        json_stream << "\"focal_long\":12.052,"
-                    << "\"focal_short\":8.154,";
+        json_stream << "\"focal_long\":" << DEFAULT_FOCAL_LONG << ","
+                    << "\"focal_short\":" << DEFAULT_FOCAL_SHORT << ",";
     }
 
     json_stream << std::setprecision(3);
@@ -138,26 +153,28 @@ std::string DetectCommandHandler::buildDetectJson(const DetectResponsePayload& p
     json_stream << "}\n";
     return json_stream.str();
 }
-//发送构建的文本和图片
+// 发送 JSON + JPEG 二进制响应
 bool DetectCommandHandler::sendDetectResponse(CommandContext& ctx,
                                               const DetectResponsePayload& payload,
-                                              const uint8_t* nv12_data) {
+                                              const uint8_t* nv12_data,
+                                              const std::vector<SegmentationResult>* draw_results) {
     const std::string json_str = buildDetectJson(payload);
 
     std::vector<uint8_t> jpeg_data;
     if (nv12_data != nullptr && payload.width > 0 && payload.height > 0) {
-        if (!encodeNV12ToJPEG(nv12_data, payload.width, payload.height, jpeg_data)) {
-            fprintf(stderr, "[Unified Server] WARNING: JPEG encoding failed, sending JSON only\n");
+        if (!encodeNV12ToJPEG(nv12_data, payload.width, payload.height, jpeg_data, draw_results)) {
+            spdlog::warn("[Unified Server] WARNING: JPEG encoding failed, sending JSON only");
         }
     }
 
     return ctx.sendBinaryResponse(json_str, jpeg_data);
 }
-//将nv12转成jpg
+// NV12 转 JPEG 编码
 bool DetectCommandHandler::encodeNV12ToJPEG(const uint8_t* nv12_data,
                                             int width,
                                             int height,
                                             std::vector<uint8_t>& jpeg_out,
+                                            const std::vector<SegmentationResult>* draw_results,
                                             int quality) {
     jpeg_out.clear();
 
@@ -180,6 +197,10 @@ bool DetectCommandHandler::encodeNV12ToJPEG(const uint8_t* nv12_data,
         cv::Mat bgr_mat;
         cv::cvtColor(nv12_mat, bgr_mat, cv::COLOR_YUV2BGR_NV12);
 
+        // 有检测结果时，把 mask/轮廓/框画到图上，便于人工验证推理是否正常
+        if (draw_results != nullptr && !draw_results->empty())
+            Postprocess::drawResults(bgr_mat, *draw_results);
+
         const std::vector<int> encode_params = {
             cv::IMWRITE_JPEG_QUALITY, quality
         };
@@ -192,7 +213,35 @@ bool DetectCommandHandler::encodeNV12ToJPEG(const uint8_t* nv12_data,
 
     return !jpeg_out.empty();
 }
-//路由分发
+// NV12 → BGR → YOLO 推理（纯 C++，直接返回检测结果，无缓存）
+bool DetectCommandHandler::detectNV12(const uint8_t* nv12_data,
+                                      int width,
+                                      int height,
+                                      std::vector<SegmentationResult>& out_results,
+                                      double* out_total_ms) const {
+    if (!yolo_model_ || !yolo_model_->isLoaded() || !nv12_data || width <= 0 || height <= 0) {
+        return false;
+    }
+
+    try {
+        auto t0 = std::chrono::high_resolution_clock::now();
+
+        cv::Mat nv(height * 3 / 2, width, CV_8UC1, const_cast<uint8_t*>(nv12_data));
+        cv::Mat bgr;
+        cv::cvtColor(nv, bgr, cv::COLOR_YUV2BGR_NV12);
+
+        out_results = yolo_model_->inferenceSegmentation(bgr);
+
+        if (out_total_ms) {
+            auto t1 = std::chrono::high_resolution_clock::now();
+            *out_total_ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        }
+        return true;
+    } catch (const std::exception& e) {
+        spdlog::error("[Unified Server] YOLO exception: {}", e.what());
+        return false;
+    }
+}
 std::string DetectCommandHandler::getName() const {
     return "DETECT";
 }
@@ -200,67 +249,66 @@ std::string DetectCommandHandler::getName() const {
 std::string DetectCommandHandler::getDescription() const {
     return "YOLO object detection with image capture";
 }
-
-bool DetectCommandHandler::isLongRunning() const {
-    return true;
-}
-//入口函数
+// 命令入口：单帧 YOLO 检测 + 厚度补偿流程
+//
+// 【本函数是"同步流水线"】
+// 当前实现直接在 server 线程同步执行：命令层单线程串行，阻塞无伤大雅。
+// 若将来 server 改多线程，需另行引入并发仲裁机制（见 DESIGN_KlipperService.md）。
+//
+// 【阅读导航：5 个阶段，任何一步失败走统一出口】
+//   S0 准备：取 klipper 指针；定义 4 个 lambda 助手（见下），主流程保持线性可读
+//   S1 唤醒+归位：sendG4Wait(唤醒) → forceHome(归位) → FinalHomeGuard(失败保险)
+//   S2 装载标定值：loadSharedMetrics 从磁盘读焦距/总高（共享配置防数据漂移）
+//   S3 抓帧+检测：请求 BEV 刷新 → grab 等一帧 → detectNV12 YOLO 定位
+//   S4 测高+复位：ThicknessService.measureFromYolo（内部移动+激光测距）→ sendGcode 回安全位
+//   S5 回复：sendDetectResponse（JSON + 检测框 JPEG，用首帧图像）
+//
+// 【lambda 助手（捕获 payload/ctx，作用域内共享）】
+//   updateBevStreamState：读取 RTSP 流/帧提供器的实时状态，填进 payload
+//   sendFailure：统一失败出口——填错误码/信息 → 组失败响应 → 返回 ERROR_CONTINUE
+//   loadSharedMetrics：读焦距与总高到 payload（多次调用保证最新）
+//   triggerBevRefresh：请求 BEV 强制刷新并打日志（首帧共用）
+//
+// 【payload 是"累计结果集"】每个阶段往里填字段，S5 一次性序列化回给客户端；
+// response_nv12 指向首帧 Snapshot 的 buffer，作用域内有效（Snapshots 生命周期覆盖全程）。
 CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
-    fprintf(stderr, "[Unified Server] Processing DETECT command from %s...\n", ctx.client_ip.c_str());
+    spdlog::info("[Unified Server] Processing DETECT command from {}...", ctx.client_ip);
 
-    //结构体的函数或变量离开作用域自动触发
-    struct YoloFrameResultGuard {
-        YOLOFrameResult* frame{nullptr};
-
-        ~YoloFrameResultGuard() {
-            if (frame) {
-                yolo_free_frame_result(frame);
-            }
-        }
-    };
-
-    struct FinalHomeGuard {
-        bool armed{false};
-
-        ~FinalHomeGuard() {
-            if (!armed) {
-                return;
-            }
-
-            std::string final_home_error;
-            const std::string final_home_script = "G90\nG28\nM400\n";
-            if (!KlipperManager::instance().sendGcode(final_home_script, nullptr, 60L, &final_home_error)) {
-                fprintf(stderr,
-                        "[Unified Server] WARNING: G28 failed during DETECT cleanup: %s\n",
-                        final_home_error.c_str());
-            } else {
-                fprintf(stderr, "[Unified Server] DETECT cleanup homed by explicit G28\n");
-            }
-        }
-    };
+    // 组合根持有的 Klipper 服务（依赖注入，取代 KlipperManager::instance()）。
+    KlipperManager* klipper = ctx.app ? ctx.app->klipper : nullptr;
 
     DetectResponsePayload payload;
     const uint8_t* response_nv12 = nullptr;
 
+    // 更新 BEV (鸟瞰图) 视频流状态的 lambda 表达式
+    // refresh_requested: 是否请求了刷新
+    // refresh_forced: 是否强制刷新
     auto updateBevStreamState = [&](bool refresh_requested = false,
                                     bool refresh_forced = false) {
-        payload.bev_stream_connected = false;
-        payload.bev_stream_ready = false;
-        payload.bev_refresh_requested = refresh_requested;
-        payload.bev_refresh_forced = refresh_forced;
-        payload.bev_pending_refresh_requests = 0;
-        payload.latest_bev_frame_id = 0;
+        // 初始化载荷(payload)中的 BEV 状态字段
+        payload.bev_stream_connected = false;       // 视频流是否已连接
+        payload.bev_stream_ready = false;           // 视频流是否已就绪
+        payload.bev_refresh_requested = refresh_requested; // 记录刷新请求状态
+        payload.bev_refresh_forced = refresh_forced;       // 记录强制刷新状态
+        payload.bev_pending_refresh_requests = 0;   // 待处理的刷新请求数归零
+        payload.latest_bev_frame_id = 0;            // 最新的一帧 ID 归零
 
+        // 如果上下文中的 app 对象为空，则直接返回
         if (!ctx.app) {
             return;
         }
 
-        payload.latest_bev_frame_id = getLatestBevFrameId(&ctx.app->capture_state);
+        // 获取最新的 BEV 帧 ID
+        payload.latest_bev_frame_id = ctx.app->bev_frame_provider.latestFrameId();
+        // 获取待处理的 BEV 刷新请求数量
         payload.bev_pending_refresh_requests =
             getPendingBevRefreshRequestCount(&ctx.app->capture_state);
 
+        // 获取服务器中的 BEV RTSP 视频流对象
         RTSPStreamer* bev_stream = &ctx.app->server.bev_stream;
-        payload.bev_stream_connected = (bev_stream->appsrc != NULL);
+        // 检查 BEV 视频流的 appsrc 插件是否已创建，以判断是否已连接（线程安全读取）
+        payload.bev_stream_connected = rtsp_streamer_has_appsrc(bev_stream);
+        // 调用工具函数判断 BEV 视频流是否已完全就绪
         payload.bev_stream_ready = rtsp_streamer_is_ready(bev_stream);
     };
 
@@ -270,32 +318,27 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
         payload.error_code = error_code ? error_code : "";
         payload.error_message = error_message;
         updateBevStreamState(payload.bev_refresh_requested, payload.bev_refresh_forced);
-        fprintf(stderr, "[Unified Server] DETECT failure (%s): %s\n",
-                error_code ? error_code : "UNKNOWN",
-                error_message.c_str());
+        spdlog::error("[Unified Server] DETECT failure ({}): {}",
+                      error_code ? error_code : "UNKNOWN", error_message);
 
         if (!sendDetectResponse(ctx, payload, response_nv12)) {
-            fprintf(stderr, "[Unified Server] Failed to send DETECT failure response\n");
+            spdlog::error("[Unified Server] Failed to send DETECT failure response");
             return CommandResult::ERROR_DISCONNECT;
         }
         return CommandResult::ERROR_CONTINUE;
     };
 
-    std::string wait_work;
-    if(KlipperManager::instance().sendGcode("g4 p20\n",nullptr,5L,&wait_work))
-    {
-        fprintf(stderr, "[Unified Server] G4 wait command response: %s\n", wait_work.c_str());
-    } else {
-        fprintf(stderr, "[Unified Server] WARNING: Failed to send G4 wait command\n");
-    }
+    // 命令层单线程串行，无并发抢占 Klipper 的风险，直接进入业务流程。
+    sendG4Wait(klipper);
 
     std::string homing_error;
-    if (!KlipperManager::instance().forceHome(&homing_error)) {
-        fprintf(stderr, "[Unified Server] Forced homing failed: %s\n", homing_error.c_str());
+    if (!klipper->forceHome(&homing_error)) {
+        spdlog::error("[Unified Server] Forced homing failed: {}",
+                      homing_error.empty() ? "(no error detail)" : homing_error);
         return sendFailure("HOMING_FAILED", homing_error);
     }
 
-    FinalHomeGuard final_home_guard;
+    FinalHomeGuard final_home_guard(klipper);
     final_home_guard.armed = true;
 
     // 从共享配置文件中读取焦距和总高，避免不同来源的数据不一致。
@@ -305,7 +348,7 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
             std::string(CALIB_RESULT_DIR) + "/" + std::string(CALIB_BIN_NAME);
         ReallinkCVConfig config;
         if (!readReallinkCVConf(conf_path, config)) {
-            fprintf(stderr, "[Unified Server] WARNING: Failed to read %s\n", conf_path.c_str());
+            spdlog::warn("[Unified Server] WARNING: Failed to read {}", conf_path);
         } else {
             payload.focal_long = config.focal_long;
             payload.focal_short = config.focal_short;
@@ -317,126 +360,100 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
             payload.total_high_ok = true;
         } else {
             payload.total_high_ok = false;
-            fprintf(stderr, "[Unified Server] WARNING: Failed to resolve totalHigh: %s\n",
-                    total_high_error.c_str());
+            spdlog::warn("[Unified Server] WARNING: Failed to resolve totalHigh: {}", total_high_error);
         }
     };
 
     loadSharedMetrics();
 
+    // 请求 BEV 刷新并更新流状态（首帧/次帧共用的逻辑）。
+    auto triggerBevRefresh = [&](const char* reason) {
+        if (!ctx.app) {
+            return;
+        }
+        updateBevStreamState();
+        const bool should_force_bev_refresh =
+            (!payload.bev_stream_connected || !payload.bev_stream_ready);
+        requestBevRefresh(&ctx.app->capture_state);
+        updateBevStreamState(true, should_force_bev_refresh);
+        spdlog::info(
+            "[Unified Server] DETECT stage: {} (connected={}, ready={}, force={}, pending={}, latest_frame_id={})",
+            reason,
+            payload.bev_stream_connected ? "true" : "false",
+            payload.bev_stream_ready ? "true" : "false",
+            should_force_bev_refresh ? "true" : "false",
+            payload.bev_pending_refresh_requests,
+            payload.latest_bev_frame_id);
+    };
+
     constexpr int kFirstFrameTimeoutMs = 1500;
-    constexpr int kFirstFramePollIntervalMs = 20;
 
-    KlipperManager::instance().deep(); // 蜂鸣器响一声，提示开始检测
-    //开始第一帧的采集
-    if (!bev_frame_buffer_has_frame()) {
-        if (ctx.app) {
-            updateBevStreamState();
-            const bool should_force_bev_refresh =
-                (!payload.bev_stream_connected || !payload.bev_stream_ready);
-            requestBevRefresh(&ctx.app->capture_state);
-            updateBevStreamState(true, should_force_bev_refresh);
-            fprintf(stderr,
-                    "[Unified Server] DETECT stage: no cached BEV frame, requesting refresh (connected=%s, ready=%s, force=%s, pending=%u, latest_frame_id=%llu)\n",
-                    payload.bev_stream_connected ? "true" : "false",
-                    payload.bev_stream_ready ? "true" : "false",
-                    should_force_bev_refresh ? "true" : "false",
-                    payload.bev_pending_refresh_requests,
-                    (unsigned long long)payload.latest_bev_frame_id);
-        }
-
-        const auto first_frame_deadline =
-            std::chrono::steady_clock::now() + std::chrono::milliseconds(kFirstFrameTimeoutMs);
-        while (!bev_frame_buffer_has_frame() &&
-               std::chrono::steady_clock::now() < first_frame_deadline) {
-            std::this_thread::sleep_for(
-                std::chrono::milliseconds(kFirstFramePollIntervalMs));
-        }
-
-        if (!bev_frame_buffer_has_frame()) {
-            updateBevStreamState(payload.bev_refresh_requested, payload.bev_refresh_forced);
-            fprintf(stderr,
-                    "[Unified Server] ERROR: No BEV frame available after refresh wait (bev_connected=%s, bev_ready=%s, pending_refresh=%u, latest_frame_id=%llu)\n",
-                    payload.bev_stream_connected ? "true" : "false",
-                    payload.bev_stream_ready ? "true" : "false",
-                    payload.bev_pending_refresh_requests,
-                    (unsigned long long)payload.latest_bev_frame_id);
-            return sendFailure("NO_BEV_FRAME", "No BEV frame available");
-        }
+    buzzDeep(klipper); // 蜂鸣器响一声，提示开始检测
+    // 首帧采集：机器刚完成 forceHome 移动，必须拿到移动后的新鲜 BEV 帧——
+    // 无条件请求刷新，并阻塞等待比"开始时缓存帧"更新的帧（条件变量，非轮询）。
+    // 旧逻辑 hasFrame()==true 时直接信任缓存，可能拿到数分钟前的旧图做检测。
+    const uint64_t min_bev_frame_id =
+        ctx.app->bev_frame_provider.latestFrameId();
+    triggerBevRefresh("request fresh BEV frame for detection");
+    Snapshot first_snap;
+    if (!ctx.app->bev_frame_provider.grabNewerThan(min_bev_frame_id, first_snap,
+                                                   nullptr, kFirstFrameTimeoutMs)) {
+        updateBevStreamState(payload.bev_refresh_requested, payload.bev_refresh_forced);
+        spdlog::error(
+            "[Unified Server] ERROR: No BEV frame available after refresh wait (bev_connected={}, bev_ready={}, pending_refresh={}, latest_frame_id={})",
+            payload.bev_stream_connected ? "true" : "false",
+            payload.bev_stream_ready ? "true" : "false",
+            payload.bev_pending_refresh_requests,
+            payload.latest_bev_frame_id);
+        return sendFailure("NO_BEV_FRAME", "No BEV frame available");
     }
 
-    const int width = bev_frame_buffer_get_width();
-    const int height = bev_frame_buffer_get_height();
-    const size_t nv12_size = bev_frame_buffer_get_frame_size();
+    const int width = static_cast<int>(first_snap.width);
+    const int height = static_cast<int>(first_snap.height);
+    const size_t nv12_size = first_snap.nv12.size();
     payload.width = width;
     payload.height = height;
 
     if (width <= 0 || height <= 0 || nv12_size == 0) {
-        fprintf(stderr, "[Unified Server] ERROR: Invalid BEV buffer meta (w=%d h=%d size=%zu)\n",
-                width, height, nv12_size);
+        spdlog::error("[Unified Server] ERROR: Invalid BEV buffer meta (w={} h={} size={})",
+                      width, height, nv12_size);
         return sendFailure("INVALID_BEV_BUFFER", "Invalid BEV buffer metadata");
     }
 
-    if (!yolo_get_results_json(yolo_handle_, width, height, payload.yolo_json)) {
-        fprintf(stderr, "[Unified Server] WARNING: Failed to build empty YOLO JSON, fallback to null image/[]\n");
-        payload.yolo_json.clear();
-    }
+    payload.yolo_json = buildObjectsJson(std::vector<SegmentationResult>{}, width, height);
 
-    //大小，帧编号
-    std::vector<uint8_t> nv12_first_frame(nv12_size);
-    size_t nv12_filled = 0;
-    uint64_t first_frame_id = 0;
-    if (!bev_frame_buffer_copy(nv12_first_frame.data(), nv12_size, &nv12_filled, &first_frame_id)) {
-        fprintf(stderr, "[Unified Server] ERROR: Failed to copy BEV frame\n");
-        return sendFailure("COPY_FAILED", "Failed to copy BEV frame");
-    }
-    response_nv12 = nv12_first_frame.data();
+    // 首帧数据：由 Snapshot 拥有，本函数作用域内有效（用完自动释放）
+    const uint8_t* nv12_first_frame = first_snap.nv12.data();
+    const uint64_t first_frame_id = first_snap.frame_id;
+    response_nv12 = nv12_first_frame;
     payload.first_frame_id = first_frame_id;
     updateBevStreamState();
 
-    //一致性校验
-    if (nv12_filled != nv12_size) {
-        fprintf(stderr, "[Unified Server] WARNING: BEV frame size mismatch (filled=%zu, expected=%zu)\n",
-                nv12_filled, nv12_size);
-    }
+    // 首帧 YOLO 推理
+    spdlog::info("[Unified Server] DETECT stage: first YOLO inference...");
+    std::vector<SegmentationResult> first_results;
+    double first_total_ms = 0.0;
 
-    //拿到第一帧做yolo检测
-    fprintf(stderr, "[Unified Server] DETECT stage: first YOLO inference...\n");
-    YOLOFrameResult first_result{};
-    YoloFrameResultGuard first_guard{&first_result};
-
-    if (!yolo_detect_nv12(yolo_handle_,
-                          nv12_first_frame.data(),
-                          width,
-                          height,
-                          first_frame_id,
-                          &first_result)) {
-        fprintf(stderr, "[Unified Server] YOLO detection failed\n");
+    if (!detectNV12(nv12_first_frame, width, height, first_results, &first_total_ms)) {
+        spdlog::error("[Unified Server] YOLO detection failed");
         return sendFailure("DETECTION_FAILED", "YOLO detection failed");
     }
-    fprintf(stderr,
-            "[Unified Server] DETECT stage: first YOLO done (count=%d, infer_ms=%.2f)\n",
-            first_result.detection_count,
-            static_cast<double>(first_result.inference_time_ms));
+    spdlog::info("[Unified Server] DETECT stage: first YOLO done (count={}, total_ms={:.2f})",
+                 first_results.size(), first_total_ms);
 
-    if (!updateYoloJson(width, height, first_result, payload)) {
-        fprintf(stderr,
-                "[Unified Server] WARNING: Failed to build first-pass YOLO JSON (frame_id=%llu)\n",
-                (unsigned long long)first_result.frame_id);
-    }
+    updateYoloJson(width, height, first_results, payload);
 
-    if (first_result.detection_count <= 0) {
-        fprintf(stderr,
-                "[Unified Server] DETECT stage: no object in first pass, continue thickness fallback flow\n");
+    if (first_results.empty()) {
+        spdlog::warn("[Unified Server] DETECT stage: no object in first pass, continue thickness fallback flow");
     }
 
     //执行测高
     payload.thickness_triggered = true;
-    fprintf(stderr, "[Unified Server] DETECT stage: thickness flow...\n");
+    spdlog::info("[Unified Server] DETECT stage: thickness flow...");
     try {
         ThicknessConfig thickness_cfg;
-        ThicknessService thickness_service(thickness_cfg);
-        payload.thickness_ok = thickness_service.measureFromYolo(first_result,
+        ThicknessService thickness_service(klipper, thickness_cfg);
+        payload.thickness_ok = thickness_service.measureFromYolo(first_results,
                                                                 payload.thickness_result,
                                                                 payload.thickness_error);
     } catch (const std::exception& e) {
@@ -445,7 +462,8 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
     }
 
     if (!payload.thickness_ok) {
-        fprintf(stderr, "[Unified Server] Thickness flow failed: %s\n", payload.thickness_error.c_str());
+        spdlog::error("[Unified Server] Thickness flow failed: {}",
+                      payload.thickness_error.empty() ? "(no error detail)" : payload.thickness_error);
         return sendFailure("THICKNESS_FAILED", payload.thickness_error);
     }
 
@@ -461,78 +479,11 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
     move_script << "M400\n";
 
     std::string move_error;
-    if (!KlipperManager::instance().sendGcode(move_script.str(), nullptr, 20L, &move_error)) {
-        fprintf(stderr, "[Unified Server] move to X10 Y10 Z0 failed before second frame capture: %s\n",
-                move_error.c_str());
+    if (!klipper->sendGcode(move_script.str(), nullptr, 20L, &move_error)) {
+        spdlog::error("[Unified Server] move to X10 Y10 Z0 failed: {}",
+                      move_error.empty() ? "(no error detail)" : move_error);
         return sendFailure("MOVE_FAILED",
                            move_error.empty() ? "move to X10 Y10 Z0 failed" : move_error);
-    }
-
-    constexpr int kSecondFrameTimeoutMs = 5000;
-    constexpr int kSecondFramePollIntervalMs = 20;
-
-    if (ctx.app) {
-        updateBevStreamState();
-        const bool should_force_bev_refresh =
-            (!payload.bev_stream_connected || !payload.bev_stream_ready);
-        requestBevRefresh(&ctx.app->capture_state);
-        updateBevStreamState(true, should_force_bev_refresh);
-        fprintf(stderr,
-                "[Unified Server] DETECT stage: BEV refresh requested (connected=%s, ready=%s, force=%s, pending=%u, latest_frame_id=%llu)\n",
-                payload.bev_stream_connected ? "true" : "false",
-                payload.bev_stream_ready ? "true" : "false",
-                should_force_bev_refresh ? "true" : "false",
-                payload.bev_pending_refresh_requests,
-                (unsigned long long)payload.latest_bev_frame_id);
-    }
-
-    //开始采集第二针的流程
-    std::vector<uint8_t> nv12_second_frame(nv12_size);
-    size_t nv12_second_filled = 0;
-    uint64_t second_frame_id = 0;
-    if (!bev_frame_buffer_copy_newer_than(nv12_second_frame.data(),
-                                          nv12_size,
-                                          &nv12_second_filled,
-                                          &second_frame_id,
-                                          first_frame_id,
-                                          kSecondFrameTimeoutMs,
-                                          kSecondFramePollIntervalMs)) {
-        updateBevStreamState(payload.bev_refresh_requested, payload.bev_refresh_forced);
-        fprintf(stderr,
-                "[Unified Server] ERROR: Timed out waiting second BEV frame after compensation (first_frame_id=%llu, latest_frame_id=%llu, bev_connected=%s, bev_ready=%s, pending_refresh=%u)\n",
-                (unsigned long long)first_frame_id,
-                (unsigned long long)payload.latest_bev_frame_id,
-                payload.bev_stream_connected ? "true" : "false",
-                payload.bev_stream_ready ? "true" : "false",
-                payload.bev_pending_refresh_requests);
-        return sendFailure("REFRESH_FRAME_TIMEOUT",
-                           "Timed out waiting second BEV frame after compensation");
-    }
-
-    response_nv12 = nv12_second_frame.data();
-
-    if (nv12_second_filled != nv12_size) {
-        fprintf(stderr, "[Unified Server] WARNING: Second BEV frame size mismatch (filled=%zu, expected=%zu)\n",
-                nv12_second_filled, nv12_size);
-    }
-
-    YOLOFrameResult second_result{};
-    YoloFrameResultGuard second_guard{&second_result};
-    if (!yolo_detect_nv12(yolo_handle_,
-                          nv12_second_frame.data(),
-                          width,
-                          height,
-                          second_frame_id,
-                          &second_result)) {
-        fprintf(stderr, "[Unified Server] Second-pass YOLO detection failed\n");
-        return sendFailure("REFRESH_DETECT_FAILED", "Second-pass YOLO detection failed");
-    }
-
-    if (!updateYoloJson(width, height, second_result, payload)) {
-        fprintf(stderr,
-                "[Unified Server] ERROR: Failed to build YOLO JSON from ResultsToJson (frame_id=%llu)\n",
-                (unsigned long long)second_result.frame_id);
-        return sendFailure("JSON_BUILD_FAILED", "Failed to build detection objects JSON");
     }
 
     loadSharedMetrics();
@@ -540,12 +491,13 @@ CommandResult DetectCommandHandler::execute(CommandContext& ctx) {
 
     payload.success = true;
 
-    if (!sendDetectResponse(ctx, payload, response_nv12)) {
-        fprintf(stderr, "[Unified Server] Failed to send response\n");
+    // 直接复用首帧的检测结果与图像，不再二次抓帧（首帧 YOLO 定位已满足补偿算法输入）
+    if (!sendDetectResponse(ctx, payload, response_nv12, &first_results)) {
+        spdlog::error("[Unified Server] Failed to send response");
         return CommandResult::ERROR_DISCONNECT;
     }
 
-    fprintf(stderr, "[Unified Server]  DETECT completed (found %d objects), connection remains open\n",
-            second_result.detection_count);
+    spdlog::info("[Unified Server] DETECT completed (found {} objects), connection remains open",
+                 first_results.size());
     return CommandResult::SUCCESS;
 }

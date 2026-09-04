@@ -12,9 +12,10 @@
 4. [核心概念](#核心概念)
 5. [各模块说明](#各模块说明)
 6. [数据流图](#数据流图)
-7. [性能分析](#性能分析)
-8. [安全检查清单](#安全检查清单)
-9. [参考标准](#参考标准)
+7. [完整运行流程](#完整运行流程)
+8. [性能分析](#性能分析)
+9. [安全检查清单](#安全检查清单)
+10. [参考标准](#参考标准)
 
 ---
 
@@ -49,8 +50,8 @@
 
 | 文件 | 变化 |
 |------|------|
-| `yolodetect/yolo_wrapper.h` | 接口不变 |
-| `yolodetect/yolo_wrapper.cpp` | 从 358 行精简到 120 行，移除调试噪音，所有推理逻辑委托给 `YOLOModel` |
+| `handlers/DetectCommandHandler.h/cpp` | 直接持有 `YOLOModel*`，`detectNV12()` 调 `inferenceSegmentation()` |
+| `yolodetect/yolo_wrapper.h/cpp` | **已删除**——推理入口改为 `DetectCommandHandler::detectNV12()` |
 
 ### 未修改文件（安全红线）
 
@@ -58,7 +59,7 @@
 |------|------|
 | `yolo/embedded_model.h` | 硬编码模型，安全要求不可动 |
 | `yolo/embedded_model.cpp` | 硬编码模型，安全要求不可动 |
-| `yolodetect/thickness.h/cpp` | 业务逻辑，接口未变 |
+| `yolodetect/thickness.h/cpp` | 业务逻辑，接口未变（下游仅消费 `boundingBox`） |
 | `handlers/DetectCommandHandler.h/cpp` | 业务逻辑，接口未变 |
 | `config.h` | 全局配置 |
 
@@ -91,8 +92,8 @@ yolo_detect_nv12()  (yolo_wrapper.cpp:170行)
 ### 新架构（V2）
 
 ```
-yolo_detect_nv12()  (yolo_wrapper.cpp:65行)
-  └── model.inferenceSegmentation()  (yolo_model.cpp)
+DetectCommandHandler::detectNV12()  (DetectCommandHandler.cpp:208)
+  └── model.inferenceSegmentation()  (yolo_model.cpp:159)
         ├── Preprocess::letterboxBGRtoRGB()    独立 namespace
         ├── fillInputTensor() + rknn_run()      纯推理
         └── Postprocess::decode()               独立 namespace
@@ -159,6 +160,7 @@ struct ObjectDetectResult {
     cv::Rect box;           // 检测框
     float confidence;       // 置信度
     int classId;            // 类别 ID
+    float maskCoefs[32];    // 掩码系数（供分割掩码解码）
 };
 
 struct ObjectDetectResultList {
@@ -173,7 +175,6 @@ struct ObjectDetectResultList {
 | 函数 | 说明 |
 |------|------|
 | `letterboxBGRtoRGB(bgr, targetW, targetH, lb)` | 等比缩放 + 边界填充 + BGR→RGB，返回 640×640 张量 + LetterBox 信息 |
-| `normalizeFloat32(rgb, scale)` | 转为 float32 + 归一化（/255.0） |
 
 ### 3. `Postprocess` namespace
 
@@ -182,8 +183,10 @@ struct ObjectDetectResultList {
 | `decode(data, numAnchors, infoDim, numClasses, confThreshold, candidates)` | 原始输出张量 (float*) | `vector<ObjectDetectResult>` | 遍历 8400 个锚点，提取满足置信度阈值的框 |
 | `iou(a, b)` | 两个 `cv::Rect` | float | 计算交并比 |
 | `nms(candidates, threshold, out, modelW, modelH)` | 候选框列表 | `ObjectDetectResultList` | 按置信度排序 + NMS 去重 |
-| `extractMasks(dets, protoTensor, origSize, lb, classNames)` | 检测框列表 + proto 张量 | `vector<SegmentationResult>` | 掩码系数 × proto 矩阵 → sigmoid → 后处理 → 二值掩码 |
-| `extractContour(binMask, epsFactor)` | 二值掩码 | `vector<cv::Point>` | findContours + approxPolyDP |
+| `keepTop1PerClass(dets)` | NMS 后的结果 | `ObjectDetectResultList` | 每个类别只保留分数最高的一个（材质识别每类一个主体） |
+| `extractMasks(dets, protoTensor, origSize, lb, modelW, modelH, classNames)` | 检测框列表 + proto 张量 | `vector<SegmentationResult>` | 掩码系数 × proto 矩阵 → resize → 裁框二值化 → 还原原图（对标官方 yolov8_seg，阈值 >0） |
+| `extractContour(binMask, epsFactor)` | 二值掩膜 | `vector<cv::Point>` | findContours + approxPolyDP（最大轮廓） |
+| `drawResults(frame, results)` | BGR 图 + 结果 | 原地绘制 | mask 半透明叠加 + 轮廓 + 框 + 类别/置信度标签（人工验证推理） |
 
 ### 4. `YOLOModel` class
 
@@ -198,13 +201,9 @@ public:
     };
 
     int    initFromMemory(modelData, modelSize);   // 硬编码模型加载 ✅ 不动
-    int    initFromFile(modelPath);                // 文件加载（调试用）
     int    release();                              // 释放 NPU 资源
 
-    // 快速检测（仅返回框，无掩码）— 对标官方 inference_yolov5_model()
-    ObjectDetectResultList inference(const cv::Mat& bgr);
-
-    // 完整分割（返回框 + 掩码 + 轮廓 + 耗时）
+    // 完整分割（返回框 + 掩码 + 耗时）— 唯一推理入口
     std::vector<SegmentationResult> inferenceSegmentation(
         const cv::Mat& bgr, Timing* timing = nullptr);
 };
@@ -223,29 +222,230 @@ model.initFromMemory(g_embedded_model_data, g_embedded_model_size);
 
 ## 数据流图
 
+### 完整链路：BEV 视频流截图 → YOLO 推理结果
+
 ```
-调用方 (DetectCommandHandler)
-    │
-    │ NV12 数据
+[BEV 视频流] stream_workers.cpp:161
+    │  ctx->app->bev_frame_provider.publish(bev_output_buf, BEV_OUTPUT_NV12_SIZE, ...)
     ▼
-yolo_detect_nv12()                    yolo_wrapper.cpp (120行)
-    │
-    │ cv::cvtColor(NV12 → BGR)
+[FrameProvider]  frame_provider.cpp:12 publish()
+    │  拷贝 NV12 到共享缓冲（只保留最新一帧）
     ▼
-model.inferenceSegmentation(bgr)      yolo_model.cpp
-    │
-    ├─ Preprocess::letterboxBGRtoRGB  yolo_preprocess.cpp ──→ 640×640 RGB + LetterBox
-    │
-    ├─ fillInputTensor + rknn_run()   硬编码模型 in embedded_model.cpp
-    │
-    └─ Postprocess::decode            yolo_postprocess.cpp ──→ vector<ObjectDetectResult>
-         └─ Postprocess::nms          ──→ ObjectDetectResultList (最多128个)
-         └─ Postprocess::extractMasks ──→ vector<SegmentationResult> (含mask/contour)
-              └─ Postprocess::extractContour
+[DETECT 命令]  DetectCommandHandler.cpp
+    │  :389  hasFrame() / :393  grab()        → 首帧（唯一抓帧，复用为回复图像）
+    ▼
+  Snapshot{ nv12, frame_id }  （NV12 数据，未解码）
     │
     ▼
-结果打包 → YOLOFrameResult (返回给调用方)
+detectNV12()  DetectCommandHandler.cpp:208
+    │  :220-222  cv::Mat nv(NV12) ──cvtColor──▶ cv::Mat bgr   （NV12 → BGR）
+    │  :224      yolo_model_->inferenceSegmentation(bgr)
+    ▼
+inferenceSegmentation(bgr)  yolo_model.cpp:159
+    │
+    ├─ Stage 1  Preprocess
+    │   :167-168  Preprocess::letterboxBGRtoRGB(bgr, m_inputW, m_inputH, lb)
+    │             └─ yolo_preprocess.cpp:8
+    │                ① 等比缩放 bgr → nw×nh（lb.scale / resize_w / resize_h）
+    │                ② 方形等比输入（BEV 1280×1280 → 640×640）短路：无填充，直接转色
+    │                ③ cvtColor BGR → RGB
+    │                → 640×640 RGB + LetterBox（lb.x_pad / y_pad 恒为 0）
+    │                ※ 非方形输入才走 copyMakeBorder 补边（通用兜底）
+    │
+    ├─ Stage 2  Inference
+    │   :171  fillInputTensor(m_inputMems[0], m_inputAttrs[0], preprocessed)
+    │   :175  rknn_run(m_ctx)         （硬编码模型 in embedded_model.cpp）
+    │   :188  convertOutputToFloat()  每个输出张量 INT8/FP16 → CV_32F
+    │          outputs[0] = [1, 8400, 72]   (4+36 类+32 掩码系数)
+    │          outputs[1] = [1, 32, 160, 160] (proto，仅分割模型)
+    │
+    └─ Stage 3  Postprocess
+        :221  Postprocess::decode(...)           ──→ vector<ObjectDetectResult>
+        :226  Postprocess::nms(...)              ──→ ObjectDetectResultList (≤128)
+        :227  Postprocess::keepTop1PerClass(...) ──→ 每类只留最高分一个
+        :233  Postprocess::extractMasks(odResults, protoTensor, bgr.size(),
+                                        lb, m_inputW, m_inputH, classNames)
+              └─ yolo_postprocess.cpp:162
+                 ① 掩码系数 × proto → 160×160 分数图
+                 ② resize → 640×640
+                 ③ 按框裁剪二值化（阈值 >0，无 sigmoid）
+                 ④ 用 lb 去 letterbox 填充 → resize 回原图尺寸
+                 → SegmentationResult.mask
+              └─ mapBoxToOriginal → boundingBox 还原到原图坐标
+              └─ findLargestContour / extractContour → .contour / .contour_full
+    │
+    ▼
+vector<SegmentationResult>  →  返回调用方
+    │
+    ├─ DetectCommandHandler.cpp:438  updateYoloJson() → buildObjectsJson()
+    │     JSON: class_id / class_name / confidence / roi_xywh
+    ├─ :492 sendDetectResponse(..., &first_results)
+    │     Postprocess::drawResults() 把 mask/轮廓/框画到首帧定格图 → JPEG 返回
+    │     （人工可直接查看模型推理是否正常）
+    └─ thickness.cpp 消费 boundingBox（已还原到原图坐标）→ 机械坐标换算
 ```
+
+### 关键点
+
+| 关注点 | 说明 |
+|--------|------|
+| `yolo_preprocess.cpp` 与 BEV 流无直接关系 | 它只收一个 `cv::Mat`，来源由调用方决定 |
+| 真正把 BEV 帧接进 YOLO 的模块 | `DetectCommandHandler::detectNV12()`（DetectCommandHandler.cpp:208） |
+| NV12 → BGR 转换位置 | DetectCommandHandler.cpp:220-222（preprocess 之前完成） |
+| LetterBox 参数如何传递 | `lb` 由 `letterboxBGRtoRGB` 写入（yolo_model.cpp:168），传给 `extractMasks`（:233）用于把掩码和检测框从 640×640 还原回原图坐标 |
+| 掩码/轮廓下游消费者 | `drawResults`（画到返回的 JPEG 上，人工验证推理）+ `thickness`（仅消费 `boundingBox`） |
+| 检测框坐标语义 | `decode`/`nms` 阶段在模型空间（640×640），`extractMasks` 内 `mapBoxToOriginal` 还原到原图（1280×1280） |
+
+---
+
+## 完整运行流程
+
+### 一、启动阶段：模型加载
+
+```
+main.cpp 启动
+  └─ 创建 YOLOModel 对象
+       ├─ 构造函数 YOLOModel::YOLOModel()          yolo_model.cpp:5
+       │    └─ m_classNames = loadClassNames()     36 类材质名
+       └─ initFromMemory(g_embedded_model_data, size)  yolo_model.cpp:8
+            └─ initCore()                          yolo_model.cpp:22
+                 ├─ rknn_init()                    加载硬编码模型 → 上下文 m_ctx
+                 ├─ rknn_query(IN_OUT_NUM)         查询输入/输出张量数量
+                 ├─ rknn_query(INPUT/OUTPUT_ATTR)  逐个查询张量属性
+                 │    └─ 读取模型输入尺寸 → m_inputW=m_inputH=640（运行时从模型查询）
+                 ├─ rknn_create_mem() × N          为每个输入/输出分配 NPU 内存
+                 ├─ rknn_set_io_mem() × N          绑定张量与内存
+                 └─ m_loaded = true
+```
+
+### 二、运行阶段：DETECT 命令触发
+
+```
+客户端发 DETECT 命令
+  └─ DetectCommandHandler::execute()              DetectCommandHandler.cpp:244
+       ├─ 独占 Klipper → 归位 → 等待 BEV 帧
+       ├─ bev_frame_provider.grab() 拿到首帧 NV12 (1280×1280)
+       └─ detectNV12(nv12, w, h, first_results)    DetectCommandHandler.cpp:208
+            ├─ cvtColor(NV12 → BGR)                  :220-222
+            └─ yolo_model_->inferenceSegmentation(bgr)  ← 唯一推理入口
+```
+
+### 三、核心推理：inferenceSegmentation()（yolo_model.cpp:160）
+
+#### Stage 1 — 预处理
+
+```
+Preprocess::letterboxBGRtoRGB(bgr, 640, 640, lb)   yolo_model.cpp:168
+  └─ yolo_preprocess.cpp:8
+       ① 计算等比缩放比 r = min(640/h, 640/w)
+       ② 记录 lb{scale, resize_w/h, x_pad, y_pad}
+       ③ cv::resize: 1280×1280 → 640×640
+       ④ 方形等比短路：无填充（非方形才 copyMakeBorder）
+       ⑤ cvtColor: BGR → RGB
+       → 640×640 RGB + LetterBox
+```
+
+#### Stage 2 — 推理 + 输出转换
+
+```
+fillInputTensor(m_inputMems[0], attrs[0], rgb)     yolo_model.cpp:171
+  └─ 按模型输入类型填内存：
+       FLOAT32 → /255.0 后直接拷
+       FLOAT16 → /255.0 + 手动 fp32→fp16
+       UINT8   → 原样拷（模型已内置归一化）
+
+rknn_run(m_ctx)                                     yolo_model.cpp:175  ← NPU 干活
+
+for 每个输出张量: convertOutputToFloat()            yolo_model.cpp:188
+  └─ INT8  → (q - zp) * scale  反量化
+     FP16  → 手动转 FP32
+     FP32  → clone
+  → outputs[0] = [1, 8400, 72]   检测主输出
+  → outputs[1] = [1, 32, 160, 160] proto 分割原型
+```
+
+#### Stage 3 — 后处理（yolo_model.cpp:197 起）
+
+```
+① 张量整形                        :201-218
+   解析 outputs[0] 维度 → (8400 × 72) 矩阵 detMat
+   （72 = 4 坐标 + 36 类分 + 32 掩码系数，可能需 transpose）
+
+② decode()                        :221  → candidates
+   └─ yolo_postprocess.cpp:8
+       遍历 8400 个锚点，每行：
+       - 找 36 类里分数最高的 → bestClass/bestScore
+       - < confThreshold(0.05) 丢弃
+       - cx,cy,bw,bh → cv::Rect（模型空间 640×640）
+       - 拷贝末尾 32 个掩码系数 → maskCoefs[32]
+
+③ nms()                          :226  → odResults (≤128)
+   └─ yolo_postprocess.cpp:66
+       - 按置信度降序排序
+       - 贪心：留分数高的，IoU>0.7 的抑制
+       - 框裁剪到 640×640 范围内
+
+④ keepTop1PerClass()             :227
+   └─ yolo_postprocess.cpp:106
+       - 每个类别只保留分数最高的一个框
+       - 材质识别语义：木头/皮革各报一个，不互相挤掉
+
+⑤ extractMasks()                 :234  → results
+   └─ yolo_postprocess.cpp:162  逐框：
+       ① matmulCoeffsProto: 32 系数 × proto(32×160×160) → 160×160 分数图
+       ② cv::resize → 640×640 分数图
+       ③ cropMaskToBox: 按框裁剪、>0 二值化（无 sigmoid）
+       ④ maskToOriginal: 去 letterbox 填充 + resize 回 1280×1280
+       ⑤ findLargestContour: findContours 最大轮廓 + approxPolyDP 简化
+       ⑥ mapBoxToOriginal: 检测框 (640) 还原到原图坐标 (1280)
+       → SegmentationResult{classId, className, confidence,
+                            boundingBox(原图), mask, contour, contour_full}
+
+计时：preprocessMs / inferenceMs / postprocessMs / totalMs
+```
+
+### 四、结果返回与消费
+
+```
+vector<SegmentationResult> 返回给 DetectCommandHandler::detectNV12
+
+DetectCommandHandler::execute():
+  ├─ updateYoloJson() → buildObjectsJson()      :438
+  │    JSON: class_id / class_name / confidence / roi_xywh
+  ├─ thickness_service.measureFromYolo(results)  :451
+  │    └─ thickness.cpp:304  选目标（面积最大）→
+  │       roi/center ← boundingBox(原图坐标) → /pixel_ratio → 机械坐标 → 控制机械臂移动+测厚
+  └─ sendDetectResponse(..., &first_results)      :492
+       └─ encodeNV12ToJPEG()                     :169
+            ├─ NV12 → BGR
+            ├─ Postprocess::drawResults()        :200
+            │    半透明 mask 叠加 + 轮廓 + 框 + "类名 置信度" 标签
+            │    ← 人工直接看返回的 JPEG 就能验证推理是否正常
+            └─ imencode → JPEG 二进制返回客户端
+```
+
+### 五、收尾
+
+```
+DetectCommandHandler 析构/程序退出
+  └─ YOLOModel::~YOLOModel() → release() → releaseCore()  yolo_model.cpp:96
+       ├─ rknn_destroy_mem() × N
+       ├─ rknn_destroy(m_ctx)
+       └─ delete[] 所有 attr/mem 数组
+```
+
+### 数据维度速查
+
+| 环节 | 数据 |
+|------|------|
+| BEV 帧 | NV12 1280×1280 |
+| 模型输入 | RGB 640×640 |
+| outputs[0] | [1, 8400, 72] = 8400 锚点 × (4+36+32) |
+| outputs[1] | [1, 32, 160, 160] proto |
+| decode 后 | 候选框（模型空间） |
+| NMS + top1 后 | ≤36 个框（每类 1 个） |
+| extractMasks 后 | SegmentationResult（框/掩码/轮廓都在原图坐标） |
+| 客户端 | JSON + 画好 mask 的 JPEG |
 
 ---
 
@@ -273,8 +473,8 @@ model.inferenceSegmentation(bgr)      yolo_model.cpp
 | 检查项 | 状态 |
 |--------|------|
 | 硬编码模型是否未修改？ | ✅ `embedded_model.h/cpp` 未动 |
-| 外部接口是否兼容？ | ✅ `yolo_wrapper.h` API 不变 |
-| `thickness` / `DetectCommandHandler` 是否受影响？ | ✅ 调用接口不变 |
+| `YOLOModel` API 是否稳定？ | ✅ `inferenceSegmentation(bgr)` 唯一推理入口 |
+| `thickness` / `DetectCommandHandler` 是否受影响？ | ✅ `thickness` 仅消费 `boundingBox`；handler 改持 `YOLOModel*`，入口不变 |
 | 新代码是否引入了外部文件依赖？ | ✅ 仅依赖 OpenCV 和 RKNN SDK（与原来相同） |
 | 是否存在内存泄漏？ | ✅ `release()` 释放所有 NPU 资源 |
 

@@ -6,7 +6,6 @@
 #define V4L2_DEVICE       "/dev/video11"
 #define INPUT_WIDTH       4224
 #define INPUT_HEIGHT      3136
-#define V4L2_BUFFER_COUNT 6
 
 
 #define ORIGINAL_WIDTH    1280
@@ -84,14 +83,15 @@
 #define CALIB_Y_MIN                 75
 #define CALIB_Y_MAX                 90
 #define CALIB_FEEDRATE              2500.0
+// 焦距默认值（标定失败/未标定时的兜底）
+#define DEFAULT_FOCAL_LONG          12.052
+#define DEFAULT_FOCAL_SHORT         8.154
 
 // ----------------------------------------------------------------------------
 
 // ----------------------------------------------------------------------------
 #define NV12_SIZE(w, h)  ((w) * (h) * 3 / 2)
 
-#define ORIGINAL_NV12_SIZE  NV12_SIZE(ORIGINAL_WIDTH, ORIGINAL_HEIGHT)
-#define BEV_INPUT_NV12_SIZE NV12_SIZE(BEV_INPUT_WIDTH, BEV_INPUT_HEIGHT)
 #define BEV_OUTPUT_NV12_SIZE NV12_SIZE(BEV_OUTPUT_WIDTH, BEV_OUTPUT_HEIGHT)
 
 #endif // CONFIG_H

@@ -1,6 +1,6 @@
 #include "UnifiedSocketServer.h"
-#include "../config.h"
-#include "../app/app_context.h"
+#include "config.h"
+#include "app/app_context.h"
 #include <cstdio>
 
 UnifiedSocketServer::UnifiedSocketServer(int port, AppContext* app)
@@ -131,8 +131,7 @@ void UnifiedSocketServer::handleClientConnection(int client_fd, const std::strin
         CommandResult result = router_->dispatch(ctx);
         
         // 根据结果决定是否断开
-        if (result == CommandResult::DISCONNECT || 
-            result == CommandResult::ERROR_DISCONNECT) {
+        if (result == CommandResult::ERROR_DISCONNECT) {
             fprintf(stderr, "[UnifiedServer] Connection closing (result: %d)\n", static_cast<int>(result));
             break;
         }
@@ -153,7 +152,7 @@ bool UnifiedSocketServer::receiveCommand(int client_fd, CommandContext& ctx) {
     
     if (ret <= 0) {
         if (ret == 0) {
-            fprintf(stderr, "[UnifiedServer] ⏱️ Connection idle timeout (60s)\n");
+            fprintf(stderr, "[UnifiedServer] Connection idle timeout (60s)\n");
         }
         return false;  // 超时或错误
     }

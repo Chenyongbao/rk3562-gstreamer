@@ -1,0 +1,8 @@
+{
+  "C_Cpp.intelliSenseEngine": "disabled",
+  "clangd.path": "C:/Users/Mr.chen/.clangd/clangd_22.1.6/bin/clangd.exe",
+  "clangd.arguments": [
+    "--background-index",
+    "--header-insertion=never"
+  ]
+}

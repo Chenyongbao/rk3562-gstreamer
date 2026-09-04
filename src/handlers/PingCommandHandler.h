@@ -1,7 +1,7 @@
 #ifndef PING_COMMAND_HANDLER_H
 #define PING_COMMAND_HANDLER_H
 
-#include "../protocol/CommandHandler.h"
+#include "protocol/CommandHandler.h"
 #include <cstdio>
 
 class PingCommandHandler : public ICommandHandler {
@@ -22,7 +22,7 @@ public:
             return CommandResult::ERROR_DISCONNECT;
         }
         
-        fprintf(stderr, "[Unified Server] ✅ PONG sent\n");
+        fprintf(stderr, "[Unified Server] PONG sent\n");
         return CommandResult::SUCCESS;
     }
 };

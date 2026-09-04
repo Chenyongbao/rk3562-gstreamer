@@ -1,19 +1,21 @@
 #ifndef DETECT_COMMAND_HANDLER_H
 #define DETECT_COMMAND_HANDLER_H
 
-#include "../protocol/CommandHandler.h"
-#include "../yolodetect/thickness.h"
-#include "../yolodetect/yolo_wrapper.h"
+#include "protocol/CommandHandler.h"
+#include "detection/thickness.h"
+#include "yolo/yolo_common.h"
 
 #include <cstdint>
 #include <string>
 #include <vector>
 
+class YOLOModel;
+
 // DETECT 指令处理器：
 // 1) 从 BEV 共享缓冲读取首帧并执行 YOLO
 // 2) 基于首帧结果执行厚度补偿（空目标时走 160,160 fallback）
-// 3) 补偿后移动到固定位姿，等待第二帧并再次 YOLO
-// 4) 组织 JSON + JPEG 二进制响应返回给客户端
+// 3) 补偿后移动到固定位姿
+// 4) 复用首帧图像与检测结果，组织 JSON + JPEG 二进制响应返回给客户端
 class DetectCommandHandler : public ICommandHandler {
 private:
     struct DetectResponsePayload {
@@ -42,30 +44,39 @@ private:
         std::string yolo_json;
     };
 
-    YOLOHandle yolo_handle_;
+    YOLOModel* yolo_model_;
 
     static std::string escapeJsonString(const std::string& input);
-    bool updateYoloJson(int width,
+    static std::string buildObjectsJson(const std::vector<SegmentationResult>& results,
+                                        int width,
+                                        int height);
+    void updateYoloJson(int width,
                         int height,
-                        const YOLOFrameResult& frame_result,
+                        const std::vector<SegmentationResult>& results,
                         DetectResponsePayload& payload) const;
+    bool detectNV12(const uint8_t* nv12_data,
+                    int width,
+                    int height,
+                    std::vector<SegmentationResult>& out_results,
+                    double* out_total_ms = nullptr) const;
     static std::string extractJsonObjectMembers(const std::string& json_object);
     std::string buildDetectJson(const DetectResponsePayload& payload) const;
     bool sendDetectResponse(CommandContext& ctx,
                             const DetectResponsePayload& payload,
-                            const uint8_t* nv12_data);
+                            const uint8_t* nv12_data,
+                            const std::vector<SegmentationResult>* draw_results = nullptr);
     bool encodeNV12ToJPEG(const uint8_t* nv12_data,
                           int width,
                           int height,
                           std::vector<uint8_t>& jpeg_out,
+                          const std::vector<SegmentationResult>* draw_results = nullptr,
                           int quality = 90);
 
 public:
-    explicit DetectCommandHandler(YOLOHandle handle);
+    explicit DetectCommandHandler(YOLOModel* model);
 
     std::string getName() const override;
     std::string getDescription() const override;
-    bool isLongRunning() const override;
     CommandResult execute(CommandContext& ctx) override;
 };
 

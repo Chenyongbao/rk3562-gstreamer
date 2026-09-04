@@ -331,17 +331,16 @@ bool KlipperManager::ensureHomed(std::string* err) {
         homed_ = false;
     }
 
-    std::string local_error;
-    std::cerr << "[KlipperManager] ensureHomed: forcing explicit G28" << std::endl;
-    if (!sendGcode("G90\nG28\n", nullptr, 30L, &local_error)) {
-        setError(err, local_error);
+    // 归位 = 顺序两步：发 G28 → 等归位完成。失败时错误信息带步骤名。
+    std::string step_error;
+    if (!sendGcode("G90\nG28\n", nullptr, 30L, &step_error)) {
+        setError(err, "发送归位指令 G90 G28 失败: " + step_error);
         std::lock_guard<std::mutex> lock(mutex_);  // 
         homed_ = false;
         return false;
     }
-
-    if (!waitHomedAxes(timeout_ms, &local_error)) {
-        setError(err, local_error);
+    if (!waitHomedAxes(timeout_ms, &step_error)) {
+        setError(err, "等待归位轴就绪失败: " + step_error);
         std::lock_guard<std::mutex> lock(mutex_);  // 
         homed_ = false;
         return false;
@@ -366,17 +365,18 @@ bool KlipperManager::forceHome(std::string* err) {
         timeout_ms = config_.homing_timeout_ms;
     }
 
-    std::string local_error;
-    std::cerr << "[KlipperManager] forceHome: sending explicit G28 + M400" << std::endl;
-    if (!sendGcode("G90\nG28\nM400\n", nullptr, 60L, &local_error)) {
-        setError(err, local_error);
+    // 强制归位 = 顺序两步：发 G28+M400 → 等归位完成。
+    std::string step_error;
+    if (!sendGcode("G90\nG28\nM400\n", nullptr, 60L, &step_error)) {
+        std::cerr << "[KlipperManager] forceHome: sending explicit G28 + M400 failed: "
+                  << step_error << std::endl;
+        setError(err, "发送归位指令 G90 G28 M400 失败: " + step_error);
         std::lock_guard<std::mutex> lock(mutex_);
         homed_ = false;
         return false;
     }
-
-    if (!waitHomedAxes(timeout_ms, &local_error)) {
-        setError(err, local_error);
+    if (!waitHomedAxes(timeout_ms, &step_error)) {
+        setError(err, "等待归位轴就绪失败: " + step_error);
         std::lock_guard<std::mutex> lock(mutex_);
         homed_ = false;
         return false;
@@ -483,6 +483,37 @@ bool KlipperManager::descendZAndProbe(const ZProbeConfig& cfg,
 
     // 将外部配置规整为可执行参数，避免 0/负值导致流程失真。
     const int max_attempts = cfg.max_attempts > 0 ? cfg.max_attempts : 1;
+
+    int consecutive_hits = 0;
+
+    // 逐轮下探：每轮 = 移动 → 触发激光 → 查询距离 → 判断停止规则。
+    // 循环体抽到 probeOnce（"拆大函数"），这里只保留调度逻辑，一眼看出整体流程。
+    for (int i = 0; i < max_attempts; ++i) {
+        ProbeStepResult r = probeOnce(cfg, i, max_attempts, out, consecutive_hits, err);
+        if (r == ProbeStepResult::StopMet) {
+            out.end_reason = ZProbeEndReason::StopMet;
+            return true;
+        }
+        if (r == ProbeStepResult::Failed) {
+            return false;  // end_reason 与 err 已在 probeOnce 内设置
+        }
+        // Continue：进入下一轮
+    }
+
+    // 防御：正常逻辑下最后一轮必在 probeOnce 内返回，此处不会到达。
+    out.end_reason = ZProbeEndReason::RuleNotMetAfterMax;
+    setError(err, "stop rule not met after max attempts");
+    return false;
+}
+
+// descendZAndProbe 的单次下探循环体（拆出以便阅读）。
+// 一轮 = 移动到目标 Z → 触发激光 → 查询距离 → 判断停止规则。
+// 返回 Continue（继续下一轮）/ StopMet（满足停止规则）/ Failed（致命失败，end_reason 已设置）。
+KlipperManager::ProbeStepResult KlipperManager::probeOnce(
+    const ZProbeConfig& cfg, int index, int max_attempts,
+    ZProbeResult& out, int& consecutive_hits, std::string* err) {
+
+    // 规整参数（同原实现，避免 0/负值导致流程失真）。
     const int query_retries = cfg.query_retries > 0 ? cfg.query_retries : 1;
     const int trigger_settle_ms = cfg.trigger_settle_ms >= 0 ? cfg.trigger_settle_ms : 0;
     const int required_hits = cfg.consecutive_hits > 0 ? cfg.consecutive_hits : 1;
@@ -490,179 +521,171 @@ bool KlipperManager::descendZAndProbe(const ZProbeConfig& cfg,
     const long move_timeout_sec = cfg.move_timeout_sec > 0 ? cfg.move_timeout_sec : 40L;
     const long trigger_timeout_sec = cfg.trigger_timeout_sec > 0 ? cfg.trigger_timeout_sec : 20L;
 
-    int consecutive_hits = 0;
+    // 以固定步长逐次下探：第 index 次移动到 index * step_mm 的绝对 Z 位置。
+    const double z_target = index * step_mm;
+    out.attempts = index + 1;
+    out.final_z_mm = z_target;
 
-    for (int i = 0; i < max_attempts; ++i) {
-        // 以固定步长逐次下探：第 i 次移动到 i * step_mm 的绝对 Z 位置。
-        const double z_target = i* step_mm;
-        out.attempts = i + 1;
-        out.final_z_mm = z_target;
+    // 若启用了 Z 上限保护，超过允许范围就立即停止，避免机构继续下探。
+    if (cfg.enforce_z_max && z_target > cfg.z_max_mm) {
+        out.end_reason = ZProbeEndReason::ZExceededMax;
+        setError(err, "Z target exceeded max limit");
+        return ProbeStepResult::Failed;
+    }
 
-        // 若启用了 Z 上限保护，超过允许范围就立即停止，避免机构继续下探。
-        if (cfg.enforce_z_max && z_target > cfg.z_max_mm) {
-            out.end_reason = ZProbeEndReason::ZExceededMax;
-            setError(err, "Z target exceeded max limit");
-            return false;
+    if (!cfg.log_prefix.empty()) {
+        std::cout << cfg.log_prefix << " AutoZ attempt " << (index + 1)
+                  << " moving to Z=" << z_target << std::endl;
+    }
+
+    std::ostringstream zscript;
+    zscript.setf(std::ios::fixed);
+    zscript.precision(3);
+    zscript << "G90\n";
+    zscript << "G1 Z" << z_target << " F" << cfg.feedrate << "\n";
+    zscript << "M400\n";
+
+    std::string move_error;
+    if (!sendGcode(zscript.str(), nullptr, move_timeout_sec, &move_error)) {
+        out.end_reason = ZProbeEndReason::MoveFailed;
+        setError(err, move_error);
+        return ProbeStepResult::Failed;
+    }
+
+    // 运动完成后主动触发一次激光测距；是否因触发失败而终止由配置决定。
+    std::string trigger_error;
+    if (!sendGcode("LASER_RANGE_SENSOR SENSOR=my_range_sensor", nullptr, trigger_timeout_sec, &trigger_error)) {
+        if (cfg.trigger_failure_is_fatal) {
+            out.end_reason = ZProbeEndReason::TriggerFailed;
+            setError(err, trigger_error);
+            return ProbeStepResult::Failed;
         }
-
         if (!cfg.log_prefix.empty()) {
-            std::cout << cfg.log_prefix << " AutoZ attempt " << (i + 1)
-                      << " moving to Z=" << z_target << std::endl;
-        }
-
-        std::ostringstream zscript;
-        zscript.setf(std::ios::fixed);
-        zscript.precision(3);
-        zscript << "G90\n";
-        zscript << "G1 Z" << z_target << " F" << cfg.feedrate << "\n";
-        zscript << "M400\n";
-
-        std::string move_error;
-        if (!sendGcode(zscript.str(), nullptr, move_timeout_sec, &move_error)) {
-            out.end_reason = ZProbeEndReason::MoveFailed;
-            setError(err, move_error);
-            return false;
-        }
-
-        // 运动完成后主动触发一次激光测距；是否因触发失败而终止由配置决定。
-        std::string trigger_error;
-        if (!sendGcode("LASER_RANGE_SENSOR SENSOR=my_range_sensor", nullptr, trigger_timeout_sec, &trigger_error)) {
-            if (cfg.trigger_failure_is_fatal) {
-                out.end_reason = ZProbeEndReason::TriggerFailed;
-                setError(err, trigger_error);
-                return false;
-            }
-            if (!cfg.log_prefix.empty()) {
-                std::cout << cfg.log_prefix
-                          << " WARNING: Failed to trigger laser range sensor: "
-                          << trigger_error << std::endl;
-            }
-        }
-
-        if (trigger_settle_ms > 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(trigger_settle_ms));
-        }
-
-        double distance = 0.0;
-        bool valid = false;
-        bool got_valid_reading = false;
-        bool got_query_response = false;
-        std::string last_query_error;
-
-        // 单次触发后允许做多次查询重试，直到拿到 valid=true 的稳定读数。
-        for (int attempt = 0; attempt < query_retries; ++attempt) {
-            std::string query_error;
-            if (queryLaserDistance(distance, valid, &query_error, 1)) {
-                got_query_response = true;
-                if (valid) {
-                    got_valid_reading = true;
-                    break;
-                }
-            } else {
-                last_query_error = query_error;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(120));
-        }
-
-        out.final_distance_mm = distance;
-        out.final_valid = valid;
-
-        // 这一轮没有拿到有效读数：根据配置决定是否失败，否则继续下一步下探。
-        if (!got_valid_reading) {
-            consecutive_hits = 0;
-            out.consecutive_hits = 0;
-
-            if (!got_query_response && cfg.query_failure_is_fatal) {
-                out.end_reason = ZProbeEndReason::QueryFailed;
-                setError(err, last_query_error.empty() ? "queryLaserDistance failed" : last_query_error);
-                return false;
-            }
-
-            if (!cfg.log_prefix.empty()) {
-                std::cout << cfg.log_prefix << " AutoZ attempt " << (i + 1)
-                          << " no valid laser reading after " << query_retries
-                          << " retries, continue" << std::endl;
-            }
-
-            if (i == max_attempts - 1) {
-                out.end_reason = ZProbeEndReason::NoValidAfterMax;
-                setError(err, "no valid laser reading after max attempts");
-                return false;
-            }
-            continue;
-        }
-
-        out.had_any_valid = true;
-
-        if (!cfg.log_prefix.empty()) {
-            std::cout << cfg.log_prefix << " AutoZ attempt " << (i + 1)
-                      << " distance=" << distance
-                      << " valid=" << (valid ? "true" : "false")
-                      << std::endl;
-        }
-
-        bool stop_met = false;
-        switch (cfg.stop_rule) {
-        case ZProbeStopRule::FirstValid:
-            // 只要拿到首个有效读数就停止。
-            stop_met = valid;
-            if (stop_met) {
-                consecutive_hits = std::max(consecutive_hits, 1);
-            }
-            break;
-
-        case ZProbeStopRule::InRangeOrBelowMin: {
-            // 距离进入目标区间，或已经低于下限，都记为一次命中。
-            const bool in_range = (distance >= cfg.stop_min_mm && distance <= cfg.stop_max_mm);
-            const bool below_min = (distance < cfg.stop_min_mm);
-            if (valid && (in_range || below_min)) {
-                ++consecutive_hits;
-            } else {
-                consecutive_hits = 0;
-            }
-
-            if (!cfg.log_prefix.empty()) {
-                std::cout << cfg.log_prefix << " AutoZ check: distance=" << distance
-                          << " range=[" << cfg.stop_min_mm << "," << cfg.stop_max_mm << "]"
-                          << " inRange=" << (in_range ? "true" : "false")
-                          << " belowMin=" << (below_min ? "true" : "false")
-                          << " consecutiveHits=" << consecutive_hits
-                          << std::endl;
-            }
-
-            stop_met = valid && consecutive_hits >= required_hits;
-            break;
-        }
-
-        case ZProbeStopRule::AtMost:
-            // 只要距离不大于 stop_max_mm 就停止。
-            stop_met = valid && distance <= cfg.stop_max_mm;
-            if (stop_met) {
-                consecutive_hits = std::max(consecutive_hits, 1);
-            } else {
-                consecutive_hits = 0;
-            }
-            break;
-        }
-
-        out.consecutive_hits = consecutive_hits;
-
-        if (stop_met) {
-            out.end_reason = ZProbeEndReason::StopMet;
-            return true;
-        }
-
-        // 已经到达最后一次尝试仍未满足停止规则，则按规则未命中失败返回。
-        if (i == max_attempts - 1) {
-            out.end_reason = ZProbeEndReason::RuleNotMetAfterMax;
-            setError(err, "stop rule not met after max attempts");
-            return false;
+            std::cout << cfg.log_prefix
+                      << " WARNING: Failed to trigger laser range sensor: "
+                      << trigger_error << std::endl;
         }
     }
 
-    out.end_reason = ZProbeEndReason::RuleNotMetAfterMax;
-    setError(err, "stop rule not met after max attempts");
-    return false;
+    if (trigger_settle_ms > 0) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(trigger_settle_ms));
+    }
+
+    double distance = 0.0;
+    bool valid = false;
+    bool got_valid_reading = false;
+    bool got_query_response = false;
+    std::string last_query_error;
+
+    // 单次触发后允许做多次查询重试，直到拿到 valid=true 的稳定读数。
+    for (int attempt = 0; attempt < query_retries; ++attempt) {
+        std::string query_error;
+        if (queryLaserDistance(distance, valid, &query_error, 1)) {
+            got_query_response = true;
+            if (valid) {
+                got_valid_reading = true;
+                break;
+            }
+        } else {
+            last_query_error = query_error;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    }
+
+    out.final_distance_mm = distance;
+    out.final_valid = valid;
+
+    // 这一轮没有拿到有效读数：根据配置决定是否失败，否则继续下一步下探。
+    if (!got_valid_reading) {
+        consecutive_hits = 0;
+        out.consecutive_hits = 0;
+
+        if (!got_query_response && cfg.query_failure_is_fatal) {
+            out.end_reason = ZProbeEndReason::QueryFailed;
+            setError(err, last_query_error.empty() ? "queryLaserDistance failed" : last_query_error);
+            return ProbeStepResult::Failed;
+        }
+
+        if (!cfg.log_prefix.empty()) {
+            std::cout << cfg.log_prefix << " AutoZ attempt " << (index + 1)
+                      << " no valid laser reading after " << query_retries
+                      << " retries, continue" << std::endl;
+        }
+
+        if (index == max_attempts - 1) {
+            out.end_reason = ZProbeEndReason::NoValidAfterMax;
+            setError(err, "no valid laser reading after max attempts");
+            return ProbeStepResult::Failed;
+        }
+        return ProbeStepResult::Continue;
+    }
+
+    out.had_any_valid = true;
+
+    if (!cfg.log_prefix.empty()) {
+        std::cout << cfg.log_prefix << " AutoZ attempt " << (index + 1)
+                  << " distance=" << distance
+                  << " valid=" << (valid ? "true" : "false")
+                  << std::endl;
+    }
+
+    bool stop_met = false;
+    switch (cfg.stop_rule) {
+    case ZProbeStopRule::FirstValid:
+        // 只要拿到首个有效读数就停止。
+        stop_met = valid;
+        if (stop_met) {
+            consecutive_hits = std::max(consecutive_hits, 1);
+        }
+        break;
+
+    case ZProbeStopRule::InRangeOrBelowMin: {
+        // 距离进入目标区间，或已经低于下限，都记为一次命中。
+        const bool in_range = (distance >= cfg.stop_min_mm && distance <= cfg.stop_max_mm);
+        const bool below_min = (distance < cfg.stop_min_mm);
+        if (valid && (in_range || below_min)) {
+            ++consecutive_hits;
+        } else {
+            consecutive_hits = 0;
+        }
+
+        if (!cfg.log_prefix.empty()) {
+            std::cout << cfg.log_prefix << " AutoZ check: distance=" << distance
+                      << " range=[" << cfg.stop_min_mm << "," << cfg.stop_max_mm << "]"
+                      << " inRange=" << (in_range ? "true" : "false")
+                      << " belowMin=" << (below_min ? "true" : "false")
+                      << " consecutiveHits=" << consecutive_hits
+                      << std::endl;
+        }
+
+        stop_met = valid && consecutive_hits >= required_hits;
+        break;
+    }
+
+    case ZProbeStopRule::AtMost:
+        // 只要距离不大于 stop_max_mm 就停止。
+        stop_met = valid && distance <= cfg.stop_max_mm;
+        if (stop_met) {
+            consecutive_hits = std::max(consecutive_hits, 1);
+        } else {
+            consecutive_hits = 0;
+        }
+        break;
+    }
+
+    out.consecutive_hits = consecutive_hits;
+
+    if (stop_met) {
+        return ProbeStepResult::StopMet;
+    }
+
+    // 已经到达最后一次尝试仍未满足停止规则，则按规则未命中失败返回。
+    if (index == max_attempts - 1) {
+        out.end_reason = ZProbeEndReason::RuleNotMetAfterMax;
+        setError(err, "stop rule not met after max attempts");
+        return ProbeStepResult::Failed;
+    }
+    return ProbeStepResult::Continue;
 }
 //焦距查询
 bool KlipperManager::queryFocal(double& focal_long,

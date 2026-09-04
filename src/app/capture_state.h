@@ -3,31 +3,46 @@
 
 #include <atomic>
 #include <cstdint>
-#include <ctime>
 
-// 主采集循环状态：用于统计、日志节流及帧序号维护。
+// 跨线程共享的 BEV 刷新请求标志。
+//
+// 说明：主相机的"按需取帧"已重构到 FrameProvider（pipeline/common/frame_provider.h），
+// BEV 的"最新帧序号"也随 BEV 帧缓冲一并迁入 FrameProvider（bev_frame_provider）。
+// 这里只保留 BEV 的"刷新请求计数"——它属于生产者侧的调度信号：
+// DETECT 命令在无缓存帧时 +1，BEV 工作线程处理完一帧后消费（决定"是否值得跑 OpenGL"）。
 struct CaptureLoopState {
-    uint64_t frame_count;
-    uint64_t skip_no_client_count;
-    uint64_t main_camera_frame_id;
-    struct timespec last_stats_time;
-    bool last_has_any_client;
-    struct timespec last_no_client_log;
+    std::atomic<int> bev_refresh_request_count{0};
 };
 
-// 重置采集循环状态。
 static inline void initCaptureLoopState(CaptureLoopState* state)
 {
     if (!state) {
         return;
     }
-    state->frame_count = 0;
-    state->skip_no_client_count = 0;
-    state->main_camera_frame_id = 0;
-    state->last_has_any_client = false;
-    state->last_no_client_log.tv_sec = 0;
-    state->last_no_client_log.tv_nsec = 0;
-    clock_gettime(CLOCK_MONOTONIC, &state->last_stats_time);
+    state->bev_refresh_request_count.store(0);
+}
+
+// BEV 刷新请求：DETECT 命令在无缓存帧时置位，BEV 工作线程处理完一帧后消费。
+static inline void requestBevRefresh(CaptureLoopState* s)
+{
+    if (s) s->bev_refresh_request_count.fetch_add(1);
+}
+
+static inline int getPendingBevRefreshRequestCount(const CaptureLoopState* s)
+{
+    return s ? s->bev_refresh_request_count.load() : 0;
+}
+
+static inline void consumeBevRefreshRequest(CaptureLoopState* s)
+{
+    if (!s) {
+        return;
+    }
+    int expected = s->bev_refresh_request_count.load();
+    while (expected > 0 &&
+           !s->bev_refresh_request_count.compare_exchange_weak(expected, expected - 1)) {
+        // 自旋重试
+    }
 }
 
 #endif // CAPTURE_STATE_H

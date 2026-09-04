@@ -90,6 +90,9 @@ static bool initSyncQueries(GLContext& ctx) {
 }
 
 
+static bool performRemapInto(GLContext& ctx, GLuint framebuffer_y, GLuint framebuffer_uv,
+                             int output_width, int output_height);
+
 bool performRemap(GLContext& ctx, int /*input_width*/, int /*input_height*/, int output_width, int output_height) {
 
     if (ctx.framebuffer_y == 0 || ctx.framebuffer_uv == 0) {
@@ -100,14 +103,30 @@ bool performRemap(GLContext& ctx, int /*input_width*/, int /*input_height*/, int
         cerr << "Error: Shader programs not initialized" << endl;
         return false;
     }
-    
+
+    return performRemapInto(ctx, ctx.framebuffer_y, ctx.framebuffer_uv,
+                            output_width, output_height);
+}
+
+// 渲染核心：把输入纹理重映射进指定的 Y/UV 两个 FBO（零拷贝输出目标）。
+static bool performRemapInto(GLContext& ctx, GLuint framebuffer_y, GLuint framebuffer_uv,
+                             int output_width, int output_height) {
+
+    if (framebuffer_y == 0 || framebuffer_uv == 0) {
+        cerr << "Error: Framebuffers not initialized" << endl;
+        return false;
+    }
+    if (ctx.shader_program_y == 0 || ctx.shader_program_uv == 0) {
+        cerr << "Error: Shader programs not initialized" << endl;
+        return false;
+    }
 
     bool use_vao = initVAO(ctx);
-    
+
 
     int uv_output_width = output_width / 2;
     int uv_output_height = output_height / 2;
-    
+
 
     glActiveTexture(GL_TEXTURE0);
     glBindTexture(GL_TEXTURE_2D, ctx.input_texture_y);
@@ -115,15 +134,15 @@ bool performRemap(GLContext& ctx, int /*input_width*/, int /*input_height*/, int
     glBindTexture(GL_TEXTURE_2D, ctx.input_texture_uv);
     glActiveTexture(GL_TEXTURE2);
     glBindTexture(GL_TEXTURE_2D, ctx.map_texture_xy);
-    
+
 
     auto start = chrono::high_resolution_clock::now();
-    
+
 
     if (use_vao) {
         glBindVertexArray(ctx.vao);
     }
-    
+
 
     if (!use_vao) {
         static const GLfloat vertexVertices[] = {
@@ -137,45 +156,45 @@ bool performRemap(GLContext& ctx, int /*input_width*/, int /*input_height*/, int
         glEnableVertexAttribArray(ctx.attr_texcoord);
         glVertexAttribPointer(ctx.attr_texcoord, 2, GL_FLOAT, GL_FALSE, 0, textureVertices);
     }
-    
 
-    glBindFramebuffer(GL_FRAMEBUFFER, ctx.framebuffer_y);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_y);
     glViewport(0, 0, output_width, output_height);
 
-    
+
     glUseProgram(ctx.shader_program_y);
 
     glUniform1i(ctx.uniform_input_y, 0);
     glUniform1i(ctx.uniform_map_xy, 2);
-    
+
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    
 
 
-    glBindFramebuffer(GL_FRAMEBUFFER, ctx.framebuffer_uv);
+
+    glBindFramebuffer(GL_FRAMEBUFFER, framebuffer_uv);
     glViewport(0, 0, uv_output_width, uv_output_height);
 
-    
+
     glUseProgram(ctx.shader_program_uv);
 
     glUniform1i(ctx.uniform_input_uv, 1);
     glUniform1i(ctx.uniform_map_xy_uv, 2);
 
-    
+
     glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
-    
+
     if (use_vao) {
         glBindVertexArray(0);
     }
-    
+
 
     glFlush();
-    
+
 
     auto end = chrono::high_resolution_clock::now();
     auto duration = chrono::duration_cast<chrono::nanoseconds>(end - start);
     ctx.remap_render_time = duration.count() / 1000000.0;
-    
+
     return true;
 }
 
@@ -358,6 +377,193 @@ bool initFramebuffers(GLContext& ctx, int output_width, int output_height) {
 
     glBindFramebuffer(GL_FRAMEBUFFER, 0);
     return true;
+}
+
+
+// 初始化一个输出池槽位：分配单块 NV12 dmabuf（Y+UV 连续），对同一 fd 的两个 offset
+// 各建一个 EGLImage 并绑成 FBO，使 OpenGL 渲染的 Y/UV 落在同一块 dmabuf 里。
+static bool initOutputSlot(GLContext& ctx, int idx, int output_width, int output_height) {
+    GLOutputSlot& s = ctx.output_pool[idx];
+    memset(&s, 0, sizeof(s));
+    s.dma.fd = -1;
+    s.egl_image_y = EGL_NO_IMAGE_KHR;
+    s.egl_image_uv = EGL_NO_IMAGE_KHR;
+    s.uv_rg88 = false;
+
+    PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR =
+        (PFNEGLCREATEIMAGEKHRPROC)eglGetProcAddress("eglCreateImageKHR");
+    PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES =
+        (PFNGLEGLIMAGETARGETTEXTURE2DOESPROC)eglGetProcAddress("glEGLImageTargetTexture2DOES");
+    if (!eglCreateImageKHR || !glEGLImageTargetTexture2DOES) {
+        return false;
+    }
+
+    int uv_w = output_width / 2;
+    int uv_h = output_height / 2;
+    s.stride_y = output_width;                    // R8，1 字节/像素
+    s.stride_uv = uv_w * 2;                       // GR88，2 字节/像素
+    s.y_size = (size_t)s.stride_y * (size_t)output_height;
+    size_t uv_size = (size_t)s.stride_uv * (size_t)uv_h;
+    size_t total_size = s.y_size + uv_size;
+
+    // 单块 dmabuf：Y 在前、UV 紧跟（NV12，mpp 单 buffer 布局）。
+    s.dma.fd = dmabuf_alloc(total_size);
+    if (s.dma.fd < 0) {
+        return false;
+    }
+    s.dma.ptr = dmabuf_mmap(s.dma.fd, total_size);
+    if (!s.dma.ptr) {
+        dmabuf_free(s.dma.fd);
+        s.dma.fd = -1;
+        return false;
+    }
+    s.dma.size = total_size;
+    s.dma.width = output_width;
+    s.dma.height = output_height;
+    s.dma.stride = s.stride_y;
+
+    bool y_ok = false;
+    const EGLint drm_r8 = 0x20203852;
+    EGLint attribs_y[] = {
+        EGL_WIDTH, output_width,
+        EGL_HEIGHT, output_height,
+        EGL_LINUX_DRM_FOURCC_EXT, drm_r8,
+        EGL_DMA_BUF_PLANE0_FD_EXT, s.dma.fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, 0,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, s.stride_y,
+        EGL_NONE
+    };
+    s.egl_image_y = eglCreateImageKHR(ctx.display, EGL_NO_CONTEXT,
+                                      EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs_y);
+    if (s.egl_image_y != EGL_NO_IMAGE_KHR) {
+        glGenTextures(1, &s.texture_y);
+        glBindTexture(GL_TEXTURE_2D, s.texture_y);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, s.egl_image_y);
+        if (glGetError() == GL_NO_ERROR) {
+            glGenFramebuffers(1, &s.framebuffer_y);
+            glBindFramebuffer(GL_FRAMEBUFFER, s.framebuffer_y);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, s.texture_y, 0);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                y_ok = true;
+            }
+        }
+    }
+
+    bool uv_ok = false;
+    uint32_t gr88 = (('G' << 0) | ('R' << 8) | ('8' << 16) | ('8' << 24));
+    EGLint attribs_uv[] = {
+        EGL_WIDTH, uv_w,
+        EGL_HEIGHT, uv_h,
+        EGL_LINUX_DRM_FOURCC_EXT, (EGLint)gr88,
+        EGL_DMA_BUF_PLANE0_FD_EXT, s.dma.fd,
+        EGL_DMA_BUF_PLANE0_OFFSET_EXT, (EGLint)s.y_size,
+        EGL_DMA_BUF_PLANE0_PITCH_EXT, s.stride_uv,
+        EGL_NONE
+    };
+    s.egl_image_uv = eglCreateImageKHR(ctx.display, EGL_NO_CONTEXT,
+                                       EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs_uv);
+    if (s.egl_image_uv == EGL_NO_IMAGE_KHR) {
+        uint32_t rg88 = (('R' << 0) | ('G' << 8) | ('8' << 16) | ('8' << 24));
+        attribs_uv[5] = (EGLint)rg88;
+        s.egl_image_uv = eglCreateImageKHR(ctx.display, EGL_NO_CONTEXT,
+                                           EGL_LINUX_DMA_BUF_EXT, (EGLClientBuffer)NULL, attribs_uv);
+        if (s.egl_image_uv != EGL_NO_IMAGE_KHR) {
+            s.uv_rg88 = true;
+        }
+    }
+    if (s.egl_image_uv != EGL_NO_IMAGE_KHR) {
+        glGenTextures(1, &s.texture_uv);
+        glBindTexture(GL_TEXTURE_2D, s.texture_uv);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, s.egl_image_uv);
+        if (glGetError() == GL_NO_ERROR) {
+            glGenFramebuffers(1, &s.framebuffer_uv);
+            glBindFramebuffer(GL_FRAMEBUFFER, s.framebuffer_uv);
+            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0,
+                                   GL_TEXTURE_2D, s.texture_uv, 0);
+            if (glCheckFramebufferStatus(GL_FRAMEBUFFER) == GL_FRAMEBUFFER_COMPLETE) {
+                uv_ok = true;
+            }
+        }
+    }
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);
+
+    if (y_ok && uv_ok) {
+        return true;
+    }
+
+    // 部分成功则回收本槽位已创建资源，避免泄漏。
+    if (s.framebuffer_y) { glDeleteFramebuffers(1, &s.framebuffer_y); s.framebuffer_y = 0; }
+    if (s.framebuffer_uv) { glDeleteFramebuffers(1, &s.framebuffer_uv); s.framebuffer_uv = 0; }
+    if (s.texture_y) { glDeleteTextures(1, &s.texture_y); s.texture_y = 0; }
+    if (s.texture_uv) { glDeleteTextures(1, &s.texture_uv); s.texture_uv = 0; }
+    if (s.egl_image_y != EGL_NO_IMAGE_KHR) { s.egl_image_y = EGL_NO_IMAGE_KHR; }
+    if (s.egl_image_uv != EGL_NO_IMAGE_KHR) { s.egl_image_uv = EGL_NO_IMAGE_KHR; }
+    free_dma_buffer(&s.dma);
+    return false;
+}
+
+bool initOutputPool(GLContext& ctx, int output_width, int output_height) {
+    ctx.output_pool_count = 0;
+    ctx.output_pool_index = 0;
+    for (int i = 0; i < BEV_OUTPUT_POOL_SIZE; ++i) {
+        if (!initOutputSlot(ctx, i, output_width, output_height)) {
+            break;
+        }
+        ctx.output_pool_count++;
+    }
+    if (ctx.output_pool_count == 0) {
+        cerr << "[BEV] ERROR: Failed to init any output pool slot" << endl;
+        return false;
+    }
+    return true;
+}
+
+bool performRemapPooled(GLContext& ctx, int /*input_width*/, int /*input_height*/,
+                        int output_width, int output_height) {
+    if (ctx.output_pool_count == 0) {
+        cerr << "Error: Output pool not initialized" << endl;
+        return false;
+    }
+    int idx = ctx.output_pool_index;
+    GLOutputSlot& s = ctx.output_pool[idx];
+    if (!performRemapInto(ctx, s.framebuffer_y, s.framebuffer_uv,
+                          output_width, output_height)) {
+        return false;
+    }
+    ctx.output_pool_index = (idx + 1) % ctx.output_pool_count;
+    return true;
+}
+
+void cleanupOutputPool(GLContext& ctx) {
+    PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR =
+        (PFNEGLDESTROYIMAGEKHRPROC)eglGetProcAddress("eglDestroyImageKHR");
+    for (int i = 0; i < BEV_OUTPUT_POOL_SIZE; ++i) {
+        GLOutputSlot& s = ctx.output_pool[i];
+        if (eglDestroyImageKHR) {
+            if (s.egl_image_y != EGL_NO_IMAGE_KHR) {
+                eglDestroyImageKHR(ctx.display, s.egl_image_y);
+                s.egl_image_y = EGL_NO_IMAGE_KHR;
+            }
+            if (s.egl_image_uv != EGL_NO_IMAGE_KHR) {
+                eglDestroyImageKHR(ctx.display, s.egl_image_uv);
+                s.egl_image_uv = EGL_NO_IMAGE_KHR;
+            }
+        }
+        if (s.framebuffer_y) { glDeleteFramebuffers(1, &s.framebuffer_y); s.framebuffer_y = 0; }
+        if (s.framebuffer_uv) { glDeleteFramebuffers(1, &s.framebuffer_uv); s.framebuffer_uv = 0; }
+        if (s.texture_y) { glDeleteTextures(1, &s.texture_y); s.texture_y = 0; }
+        if (s.texture_uv) { glDeleteTextures(1, &s.texture_uv); s.texture_uv = 0; }
+        if (s.dma.fd >= 0) { free_dma_buffer(&s.dma); }
+    }
+    ctx.output_pool_count = 0;
+    ctx.output_pool_index = 0;
 }
 
 

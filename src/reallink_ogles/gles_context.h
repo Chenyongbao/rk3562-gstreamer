@@ -15,6 +15,28 @@
 using namespace cv;
 
 
+// BEV 输出多缓冲槽位数：OpenGL 每帧渲染进不同槽位，推流异步消费，
+// 避免编码器还在读上一帧时被下一帧渲染覆盖。
+#define BEV_OUTPUT_POOL_SIZE 3
+
+// 一个输出槽位：单块 NV12 dmabuf（Y+UV 连续，mpp 单 buffer 布局）。
+// 用同一 fd 的两个 offset 各建一个 EGLImage（Y=R8@offset0，UV=GR88@offset y_size），
+// OpenGL 分别渲染进这两块 FBO，但数据落在同一块 dmabuf，推流只需一个 fd。
+struct GLOutputSlot {
+    dma_buffer_t dma;          // 单块 NV12 dmabuf（Y+UV 连续）
+    EGLImageKHR egl_image_y;   // 指向 dma offset 0（Y 平面，R8）
+    EGLImageKHR egl_image_uv;  // 指向 dma offset y_size（UV 平面，GR88）
+    GLuint texture_y;
+    GLuint texture_uv;
+    GLuint framebuffer_y;
+    GLuint framebuffer_uv;
+    bool uv_rg88;
+    int stride_y;              // Y 平面行宽（字节）
+    int stride_uv;             // UV 平面行宽（字节）
+    size_t y_size;             // Y 平面总字节数（= UV 在 buffer 内的偏移）
+};
+
+
 typedef EGLDisplay (EGLAPIENTRY *PFNEGLGETPLATFORMDISPLAYEXTPROC)(EGLenum platform, void *native_display, const EGLint *attrib_list);
 typedef EGLImageKHR (EGLAPIENTRY *PFNEGLCREATEIMAGEKHRPROC)(EGLDisplay dpy, EGLContext ctx, EGLenum target, EGLClientBuffer buffer, const EGLint *attrib_list);
 typedef EGLBoolean (EGLAPIENTRY *PFNEGLDESTROYIMAGEKHRPROC)(EGLDisplay dpy, EGLImageKHR image);
@@ -43,6 +65,11 @@ struct GLContext {
     dma_buffer_t dma_output_uv;
     EGLImageKHR egl_image_output_y;
     EGLImageKHR egl_image_output_uv;
+
+    // 零拷贝推流输出池：轮转渲染，供 RTSP 异步消费。
+    GLOutputSlot output_pool[BEV_OUTPUT_POOL_SIZE];
+    int output_pool_count;   // 实际成功初始化的槽位数
+    int output_pool_index;   // 下一帧要渲染进的槽位
     
 
     GLuint pbo_y[2];
@@ -146,6 +173,12 @@ bool performRemap(GLContext& ctx, int input_width, int input_height, int output_
 
 
 bool initFramebuffers(GLContext& ctx, int output_width, int output_height);
+
+
+// 零拷贝输出池：初始化 / 渲染到当前槽位 / 清理。
+bool initOutputPool(GLContext& ctx, int output_width, int output_height);
+bool performRemapPooled(GLContext& ctx, int input_width, int input_height, int output_width, int output_height);
+void cleanupOutputPool(GLContext& ctx);
 
 
 bool syncGPU(GLContext& ctx, int width, int height);

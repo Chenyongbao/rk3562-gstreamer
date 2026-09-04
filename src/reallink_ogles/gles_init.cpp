@@ -38,6 +38,14 @@ bool initGLContext(GLContext& ctx, int width, int height) {
     memset(&ctx.dma_output_uv, 0, sizeof(ctx.dma_output_uv));
     ctx.dma_output_y.fd = -1;
     ctx.dma_output_uv.fd = -1;
+    memset(ctx.output_pool, 0, sizeof(ctx.output_pool));
+    for (int i = 0; i < BEV_OUTPUT_POOL_SIZE; ++i) {
+        ctx.output_pool[i].dma.fd = -1;
+        ctx.output_pool[i].egl_image_y = EGL_NO_IMAGE_KHR;
+        ctx.output_pool[i].egl_image_uv = EGL_NO_IMAGE_KHR;
+    }
+    ctx.output_pool_count = 0;
+    ctx.output_pool_index = 0;
     memset(&ctx.dma_input_y, 0, sizeof(ctx.dma_input_y));
     ctx.dma_input_y.fd = -1;
     memset(&ctx.dma_input_uv, 0, sizeof(ctx.dma_input_uv));
@@ -279,6 +287,8 @@ void cleanupGLContext(GLContext& ctx) {
     if (ctx.dma_input_uv.fd >= 0) {
         free_dma_buffer(&ctx.dma_input_uv);
     }
+
+    cleanupOutputPool(ctx);
     
     if (ctx.framebuffer) glDeleteFramebuffers(1, &ctx.framebuffer);
     if (ctx.output_texture) glDeleteTextures(1, &ctx.output_texture);

@@ -26,6 +26,7 @@ struct BevProcessor {
     uint64_t map_version;
     long total_process_time_us;
     int process_count;
+    int last_rendered_slot;
 };
 
 namespace {
@@ -275,6 +276,7 @@ BevHandle bev_init(int input_width, int input_height,
         processor->total_process_time_us = 0;
         processor->process_count = 0;
         processor->initialized = false;
+        processor->last_rendered_slot = -1;
 
         cameraInit();
 
@@ -308,6 +310,13 @@ BevHandle bev_init(int input_width, int input_height,
 
         if (!initFramebuffers(processor->gl_ctx, output_width, output_height)) {
             cerr << "[BEV] ERROR: Failed to init framebuffers!" << endl;
+            cleanupGLContext(processor->gl_ctx);
+            delete processor;
+            return nullptr;
+        }
+
+        if (!initOutputPool(processor->gl_ctx, output_width, output_height)) {
+            cerr << "[BEV] ERROR: Failed to init zero-copy output pool!" << endl;
             cleanupGLContext(processor->gl_ctx);
             delete processor;
             return nullptr;
@@ -484,4 +493,116 @@ void bev_release_output_dmabuf(BevHandle handle)
     sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
     ioctl(p->gl_ctx.dma_output_y.fd, DMA_BUF_IOCTL_SYNC, &sync);
     ioctl(p->gl_ctx.dma_output_uv.fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
+bool bev_process_frame_dmabuf_pooled(BevHandle handle,
+                                     int nv12_input_fd,
+                                     int input_stride,
+                                     size_t input_size,
+                                     int* out_fd, int* out_stride_y, int* out_stride_uv)
+{
+    if (!handle || nv12_input_fd < 0) {
+        return false;
+    }
+
+    BevProcessor* processor = (BevProcessor*)handle;
+    if (!processor->initialized) {
+        return false;
+    }
+    if (processor->gl_ctx.output_pool_count == 0) {
+        return false;
+    }
+
+    if (!refreshOverheadMaps(processor)) {
+        return false;
+    }
+
+    if (!uploadNV12DmabufTextures(processor->gl_ctx,
+                                  nv12_input_fd,
+                                  processor->input_width,
+                                  processor->input_height,
+                                  input_stride,
+                                  input_size)) {
+        cerr << "[BEV] ERROR: Failed to import external NV12 dmabuf" << endl;
+        return false;
+    }
+
+    // 渲染到输出池当前槽位，渲染后 index 推进到下一槽位。
+    if (!performRemapPooled(processor->gl_ctx,
+                            processor->input_width,
+                            processor->input_height,
+                            processor->output_width,
+                            processor->output_height)) {
+        return false;
+    }
+
+    // 反推出刚渲染的槽位。
+    int idx = processor->gl_ctx.output_pool_index;
+    idx = (idx == 0) ? (processor->gl_ctx.output_pool_count - 1) : (idx - 1);
+    processor->last_rendered_slot = idx;
+
+    GLOutputSlot& s = processor->gl_ctx.output_pool[idx];
+
+    // 确保 GPU 渲染完成，并使数据对读者（CPU 读回 / 编码器）可见。
+    glFlush();
+    glFinish();
+    struct dma_buf_sync sync;
+    sync.flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ;
+    ioctl(s.dma.fd, DMA_BUF_IOCTL_SYNC, &sync);
+
+    if (out_fd) *out_fd = s.dma.fd;
+    if (out_stride_y) *out_stride_y = s.stride_y;
+    if (out_stride_uv) *out_stride_uv = s.stride_uv;
+
+    processor->first_frame = false;
+    return true;
+}
+
+void bev_release_output_pool_slot(BevHandle handle)
+{
+    if (!handle) return;
+    BevProcessor* p = (BevProcessor*)handle;
+    if (p->last_rendered_slot < 0 || p->last_rendered_slot >= p->gl_ctx.output_pool_count) return;
+    GLOutputSlot& s = p->gl_ctx.output_pool[p->last_rendered_slot];
+    struct dma_buf_sync sync;
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    ioctl(s.dma.fd, DMA_BUF_IOCTL_SYNC, &sync);
+}
+
+bool bev_read_last_output(BevHandle handle, uint8_t* nv12_output, size_t output_size)
+{
+    if (!handle || !nv12_output) return false;
+    BevProcessor* p = (BevProcessor*)handle;
+    if (p->last_rendered_slot < 0 || p->last_rendered_slot >= p->gl_ctx.output_pool_count) {
+        return false;
+    }
+
+    const size_t expected =
+        static_cast<size_t>(p->output_width) * static_cast<size_t>(p->output_height) * 3 / 2;
+    if (output_size < expected) {
+        return false;
+    }
+
+    GLOutputSlot& s = p->gl_ctx.output_pool[p->last_rendered_slot];
+    if (!s.dma.ptr) {
+        return false;
+    }
+
+    const int w = p->output_width;
+    const int h = p->output_height;
+    const uint8_t* base = static_cast<const uint8_t*>(s.dma.ptr);
+
+    // Y 平面：按 stride_y 逐行拷贝紧凑行（stride 可能 > width）。
+    for (int r = 0; r < h; ++r) {
+        memcpy(nv12_output + r * w, base + r * s.stride_y, w);
+    }
+
+    // UV 平面：交错 UV，紧跟 Y 之后（offset = y_size）。
+    const uint8_t* uv = base + s.y_size;
+    uint8_t* out_uv = nv12_output + w * h;
+    for (int r = 0; r < h / 2; ++r) {
+        memcpy(out_uv + r * w, uv + r * s.stride_uv, w);
+    }
+
+    return true;
 }

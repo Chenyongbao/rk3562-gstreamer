@@ -1,0 +1,3 @@
+# 单元测试构建产物（tests/CMakeLists.txt）
+build-tests/
+build/
